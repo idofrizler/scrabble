@@ -70,37 +70,101 @@ class OCRService:
             except Exception as e:
                 print(f"OCR Worker Error: {e}")
     
+    def get_smart_tile_letter(self, tile_face):
+            """
+            Advanced preprocessing to isolate the letter from tile borders/shadows.
+            Strategy: Find the 'best' contour based on size + centrality, not just size.
+            """
+            # 1. Grayscale
+            if len(tile_face.shape) == 3:
+                gray = cv2.cvtColor(tile_face, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = tile_face
+
+            h, w = gray.shape
+
+            # 2. Threshold (Inverted)
+            # Letter becomes WHITE, Wood becomes BLACK
+            thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+
+            # 3. Morphological Opening (Disconnect letter from border)
+            # If the letter 'R' touches the black border slightly, this cuts that link.
+            kernel = np.ones((3,3), np.uint8)
+            thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+
+            # 4. Find Contours
+            cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if not cnts: return gray # Fail safe
+
+            best_cnt = None
+            max_score = 0
+            
+            # Center of the image
+            center_x, center_y = w // 2, h // 2
+
+            for c in cnts:
+                # --- FILTER 1: BORDER TOUCHING ---
+                # If the contour touches the edge of the image (within 2px), it's likely a border artifact.
+                x, y, cw, ch = cv2.boundingRect(c)
+                if x <= 2 or y <= 2 or (x + cw) >= w - 2 or (y + ch) >= h - 2:
+                    continue
+
+                # --- FILTER 2: SIZE ---
+                area = cv2.contourArea(c)
+                # Must be at least 5% of the tile area (to be visible) 
+                # and less than 80% (to not be the whole box)
+                if area < (h * w * 0.05) or area > (h * w * 0.8):
+                    continue
+
+                # --- FILTER 3: ASPECT RATIO ---
+                # Letters are generally somewhat square-ish (0.2 to 3.0 ratio).
+                # Long thin lines (shadows) are rejected.
+                aspect_ratio = float(cw) / ch
+                if aspect_ratio < 0.2 or aspect_ratio > 4.0:
+                    continue
+
+                # --- SCORING: CENTRALITY ---
+                # Calculate distance from blob center to image center
+                M = cv2.moments(c)
+                if M["m00"] != 0:
+                    cX = int(M["m10"] / M["m00"])
+                    cY = int(M["m01"] / M["m00"])
+                    
+                    dist_from_center = np.sqrt((cX - center_x)**2 + (cY - center_y)**2)
+                    
+                    # Score = Area / Distance (Big blobs near center win)
+                    # We add 1 to distance to avoid division by zero
+                    score = area / (dist_from_center + 1.0)
+                    
+                    if score > max_score:
+                        max_score = score
+                        best_cnt = c
+
+            # 5. Draw the Winner
+            if best_cnt is not None:
+                # Create a clean white canvas
+                clean_img = np.full_like(gray, 255)
+                # Draw the letter in BLACK
+                cv2.drawContours(clean_img, [best_cnt], -1, 0, -1)
+                return clean_img
+            
+            # If no valid letter found, return a blank white image (safest fallback)
+            return np.full_like(gray, 255)
+
     def _recognize_tile(self, tile_face):
         """Detects the letter on a Scrabble tile. Returns (letter, confidence, processed_image)."""
-        h, w = tile_face.shape[:2]
-        
-        # Cover the bottom-right score number with the tile's dominant color
-        # Get the dominant (median) color from the center of the tile
-        center_region = tile_face[h//4:3*h//4, w//4:3*w//4]
-        dominant_color = np.median(center_region.reshape(-1, 3), axis=0).astype(np.uint8)
-        
-        # Cover the bottom-right 25% x 25% corner with the dominant color
-        score_region_y = int(h * 0.75)
-        score_region_x = int(w * 0.75)
-        tile_clean = tile_face.copy()
-        tile_clean[score_region_y:, score_region_x:] = dominant_color
-        
-        # Crop margins to focus on the letter (avoid edges)
-        margin_h = int(h * 0.15)
-        margin_w = int(w * 0.15)
-        roi = tile_clean[margin_h:h-margin_h, margin_w:w-margin_w]
-        
-        # Pre-processing
-        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-        thresh = cv2.medianBlur(thresh, 3)
+        # Use the smart cleaning method that removes score number via contour filtering
+        clean_img = self.get_smart_tile_letter(tile_face)
 
         # OCR Config
+        # --psm 10: Treat the image as a single character
+        # whitelist: Only allow A-Z (ignores numbers and symbols)
         custom_config = r'--psm 10 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ'
         
         try:
             # Use image_to_data to get confidence scores
-            data = pytesseract.image_to_data(thresh, config=custom_config, output_type=pytesseract.Output.DICT)
+            data = pytesseract.image_to_data(clean_img, config=custom_config, output_type=pytesseract.Output.DICT)
             
             # Find the best detection with confidence
             best_letter = None
@@ -115,12 +179,16 @@ class OCRService:
                     best_conf = conf
             
             if best_letter:
-                return (best_letter, best_conf, tile_clean)
+                # Convert clean_img to 3-channel for consistent caching
+                clean_img_color = cv2.cvtColor(clean_img, cv2.COLOR_GRAY2BGR)
+                return (best_letter, best_conf, clean_img_color)
                 
         except Exception as e:
             print(f"OCR Error: {e}")
-            
-        return ("?", 0, tile_clean)
+        
+        # Convert to color for consistent caching
+        clean_img_color = cv2.cvtColor(clean_img, cv2.COLOR_GRAY2BGR)
+        return ("?", 0, clean_img_color)
 
 class ScrabbleTracker:
     def __init__(self, video_path, manual_corners=None):
@@ -512,6 +580,9 @@ class ScrabbleTracker:
             ret, frame = self.cap.read()
             if not ret: break
             
+            # Keep a clean copy of the frame for tile extraction (before any drawing)
+            frame_clean = frame.copy()
+            
             # Calculate delta time
             current_time = time.time()
             delta_ms = (current_time - self.last_frame_time) * 1000.0
@@ -627,8 +698,8 @@ class ScrabbleTracker:
                             if self.locked_cells[r, c]:
                                 # Cell is LOCKED - submit OCR if needed
                                 if self.board_state[r][c] is None and not self.ocr_service.is_pending(r, c):
-                                    # Extract tile face and submit for async OCR
-                                    tile_face = self.extract_tile_face(frame, r, c, output_size=(100, 100), margin_scale=0.1)
+                                    # Extract tile face from clean frame (no overlays)
+                                    tile_face = self.extract_tile_face(frame_clean, r, c, output_size=(100, 100), margin_scale=0.1)
                                     if tile_face is not None:
                                         # Cache the tile image for debugging
                                         self.tile_image_cache[(r, c)] = tile_face.copy()
