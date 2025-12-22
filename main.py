@@ -62,10 +62,9 @@ class OCRService:
                 if self.pending.get((row, col)) != req_id:
                     continue  # Request cancelled during OCR
                 
-                # Remove from pending and add to results
+                # Remove from pending and add to results (include "?" results too)
                 self.pending.pop((row, col), None)
-                if letter != "?":
-                    self.results.put((row, col, letter, confidence, tile_clean))
+                self.results.put((row, col, letter, confidence, tile_clean))
                     
             except Exception as e:
                 print(f"OCR Worker Error: {e}")
@@ -255,6 +254,11 @@ class ScrabbleTracker:
         
         # Cache of tile images sent to OCR: (row, col) -> tile_image
         self.tile_image_cache = {}
+        
+        # OCR retry tracking: (row, col) -> last_attempt_time
+        self.last_ocr_attempt_time = {}
+        self.OCR_RETRY_INTERVAL_MS = 1000.0  # Retry every 1 second
+        self.OCR_MIN_CONFIDENCE = 50  # Retry if confidence below this
         
         # Async OCR service
         self.ocr_service = OCRService()
@@ -681,35 +685,56 @@ class ScrabbleTracker:
                     cv2.imshow('2D Board State', warped_board_display)
 
                     # --- ASYNC OCR PROCESSING ---
+                    current_time_ms = current_time * 1000.0
                     
                     # 1. Collect completed OCR results (now includes confidence and processed image)
                     for (r, c, letter, confidence, tile_clean) in self.ocr_service.get_results():
                         # Only apply if cell is still locked (wasn't cancelled)
-                        if self.locked_cells[r, c] and self.board_state[r][c] is None:
-                            self.board_state[r][c] = (letter, confidence)
-                            # Update cache with the processed image (score masked out)
-                            self.tile_image_cache[(r, c)] = tile_clean
-                            print(f"Recognized {letter} (conf={confidence}) at ({r},{c})")
+                        if self.locked_cells[r, c]:
+                            existing = self.board_state[r][c]
+                            
+                            # Update if: no existing result OR new result has higher confidence
+                            if existing is None:
+                                self.board_state[r][c] = (letter, confidence)
+                                self.tile_image_cache[(r, c)] = tile_clean
+                                print(f"Recognized {letter} (conf={confidence}) at ({r},{c})")
+                            elif confidence > existing[1]:
+                                # New result is better - update
+                                old_letter, old_conf = existing
+                                self.board_state[r][c] = (letter, confidence)
+                                self.tile_image_cache[(r, c)] = tile_clean
+                                print(f"Updated ({r},{c}): {old_letter}({old_conf}) -> {letter}({confidence})")
                     
-                    # 2. Process cells - submit new OCR requests or cancel stale ones
+                    # 2. Process cells - submit new OCR requests or retry low-confidence ones
                     for r in range(self.grid_size):
                         for c in range(self.grid_size):
                             
                             if self.locked_cells[r, c]:
-                                # Cell is LOCKED - submit OCR if needed
-                                if self.board_state[r][c] is None and not self.ocr_service.is_pending(r, c):
-                                    # Extract tile face from clean frame (no overlays)
+                                # Cell is LOCKED
+                                existing = self.board_state[r][c]
+                                needs_ocr = False
+                                
+                                if existing is None:
+                                    # No result yet - need OCR
+                                    needs_ocr = True
+                                elif existing[1] < self.OCR_MIN_CONFIDENCE:
+                                    # Low confidence - retry after interval
+                                    last_attempt = self.last_ocr_attempt_time.get((r, c), 0)
+                                    if current_time_ms - last_attempt >= self.OCR_RETRY_INTERVAL_MS:
+                                        needs_ocr = True
+                                
+                                # Submit OCR if needed and not already pending
+                                if needs_ocr and not self.ocr_service.is_pending(r, c):
                                     tile_face = self.extract_tile_face(frame_clean, r, c, output_size=(100, 100), margin_scale=0.1)
                                     if tile_face is not None:
-                                        # Cache the tile image for debugging
-                                        self.tile_image_cache[(r, c)] = tile_face.copy()
+                                        self.last_ocr_attempt_time[(r, c)] = current_time_ms
                                         self.ocr_service.submit(tile_face, r, c)
                             else:
-                                # Cell is UNLOCKED - cancel any pending OCR and clear letter
+                                # Cell is UNLOCKED - cancel any pending OCR and clear state
                                 self.ocr_service.cancel(r, c)
                                 self.board_state[r][c] = None
-                                # Remove from cache when cell is cleared
                                 self.tile_image_cache.pop((r, c), None)
+                                self.last_ocr_attempt_time.pop((r, c), None)
 
                     # Render the separate digital window
                     digital_board = self.draw_digital_board()
