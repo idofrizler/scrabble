@@ -3,7 +3,113 @@ import numpy as np
 import argparse
 import sys
 import time
+import threading
+import queue
 import pytesseract
+
+
+class OCRService:
+    """Async OCR service that processes tile recognition in a background thread."""
+    
+    def __init__(self):
+        self.queue = queue.Queue()
+        self.pending = {}  # (row, col) -> request_id
+        self.request_counter = 0
+        self.results = queue.Queue()  # Thread-safe results queue
+        self.worker = threading.Thread(target=self._process_loop, daemon=True)
+        self.worker.start()
+    
+    def submit(self, tile_face, row, col):
+        """Submit a tile for OCR processing."""
+        self.request_counter += 1
+        req_id = self.request_counter
+        self.pending[(row, col)] = req_id
+        self.queue.put((tile_face.copy(), row, col, req_id))
+    
+    def cancel(self, row, col):
+        """Cancel pending OCR request for a cell (called when cell unlocks)."""
+        self.pending.pop((row, col), None)
+    
+    def is_pending(self, row, col):
+        """Check if there's a pending OCR request for this cell."""
+        return (row, col) in self.pending
+    
+    def get_results(self):
+        """Get all available OCR results (non-blocking)."""
+        results = []
+        while True:
+            try:
+                result = self.results.get_nowait()
+                results.append(result)
+            except queue.Empty:
+                break
+        return results
+    
+    def _process_loop(self):
+        """Background thread that processes OCR requests."""
+        while True:
+            try:
+                tile_face, row, col, req_id = self.queue.get()
+                
+                # Check if request is still valid (not cancelled)
+                if self.pending.get((row, col)) != req_id:
+                    continue  # Stale request, skip
+                
+                # Perform OCR
+                letter, confidence = self._recognize_tile(tile_face)
+                
+                # Check again after OCR (cell might have unlocked during processing)
+                if self.pending.get((row, col)) != req_id:
+                    continue  # Request cancelled during OCR
+                
+                # Remove from pending and add to results
+                self.pending.pop((row, col), None)
+                if letter != "?":
+                    self.results.put((row, col, letter, confidence))
+                    
+            except Exception as e:
+                print(f"OCR Worker Error: {e}")
+    
+    def _recognize_tile(self, tile_face):
+        """Detects the letter on a Scrabble tile. Returns (letter, confidence)."""
+        # Crop center to remove the small score number (bottom right)
+        h, w = tile_face.shape[:2]
+        margin_h = int(h * 0.15)
+        margin_w = int(w * 0.15)
+        
+        roi = tile_face[margin_h:h-margin_h, margin_w:w-margin_w]
+        
+        # Pre-processing
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        thresh = cv2.medianBlur(thresh, 3)
+
+        # OCR Config
+        custom_config = r'--psm 10 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        
+        try:
+            # Use image_to_data to get confidence scores
+            data = pytesseract.image_to_data(thresh, config=custom_config, output_type=pytesseract.Output.DICT)
+            
+            # Find the best detection with confidence
+            best_letter = None
+            best_conf = 0
+            
+            for i, text in enumerate(data['text']):
+                clean_text = text.strip().upper()
+                conf = int(data['conf'][i]) if data['conf'][i] != '-1' else 0
+                
+                if len(clean_text) == 1 and clean_text.isalpha() and conf > best_conf:
+                    best_letter = clean_text
+                    best_conf = conf
+            
+            if best_letter:
+                return (best_letter, best_conf)
+                
+        except Exception as e:
+            print(f"OCR Error: {e}")
+            
+        return ("?", 0)
 
 class ScrabbleTracker:
     def __init__(self, video_path, manual_corners=None):
@@ -65,10 +171,14 @@ class ScrabbleTracker:
         # Negative because we extrude "up" (Z- direction relative to board plane)
         self.TILE_HEIGHT_RATIO = 0.25
 
-        self.board_state = [["" for _ in range(self.grid_size)] for _ in range(self.grid_size)]
+        # Board state stores tuples: (letter, confidence) or None for empty cells
+        self.board_state = [[None for _ in range(self.grid_size)] for _ in range(self.grid_size)]
+        
+        # Async OCR service
+        self.ocr_service = OCRService()
 
     def draw_digital_board(self):
-        """Creates a clean digital visualization of the board state."""
+        """Creates a clean digital visualization of the board state with confidence coloring."""
         # Create a blank beige image (resembling a board)
         board_img = np.zeros((450, 450, 3), dtype=np.uint8)
         board_img[:] = (220, 245, 245) # Beige background (BGR)
@@ -84,10 +194,38 @@ class ScrabbleTracker:
                 cv2.rectangle(board_img, (x1, y1), (x1 + step_x, y1 + step_y), (150, 150, 150), 1)
                 
                 # Draw the letter if it exists
-                letter = self.board_state[row][col]
-                if letter:
-                    # Draw a tile background (wooden color)
-                    cv2.rectangle(board_img, (x1+2, y1+2), (x1 + step_x-2, y1 + step_y-2), (180, 210, 255), -1)
+                cell_data = self.board_state[row][col]
+                if cell_data is not None:
+                    letter, confidence = cell_data
+                    
+                    # Calculate tile background color based on confidence (0-100)
+                    # High confidence (90+): Green-ish
+                    # Medium confidence (60-90): Yellow-ish  
+                    # Low confidence (<60): Red-ish
+                    if confidence >= 90:
+                        # Green tint: BGR (180, 255, 200) - light green
+                        tile_color = (180, 255, 200)
+                    elif confidence >= 60:
+                        # Yellow/Orange tint: BGR (150, 220, 255) - light orange
+                        # Interpolate between green and orange
+                        t = (confidence - 60) / 30.0  # 0 to 1
+                        tile_color = (
+                            int(150 + t * 30),   # B: 150 -> 180
+                            int(220 + t * 35),   # G: 220 -> 255
+                            int(255 - t * 55)    # R: 255 -> 200
+                        )
+                    else:
+                        # Red tint: BGR (150, 150, 255) - light red
+                        # Interpolate between orange and red
+                        t = confidence / 60.0  # 0 to 1
+                        tile_color = (
+                            int(150),            # B: 150
+                            int(150 + t * 70),   # G: 150 -> 220
+                            int(255)             # R: 255
+                        )
+                    
+                    # Draw a tile background with confidence color
+                    cv2.rectangle(board_img, (x1+2, y1+2), (x1 + step_x-2, y1 + step_y-2), tile_color, -1)
                     
                     # Center the text
                     text_size = cv2.getTextSize(letter, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
@@ -96,6 +234,11 @@ class ScrabbleTracker:
                     
                     cv2.putText(board_img, letter, (text_x, text_y), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+                    
+                    # Draw small confidence value in corner
+                    conf_text = f"{confidence}"
+                    cv2.putText(board_img, conf_text, (x1 + 3, y1 + step_y - 3), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.25, (80, 80, 80), 1)
         
         return board_img
 
@@ -420,23 +563,30 @@ class ScrabbleTracker:
                     
                     cv2.imshow('2D Board State', warped_board_display)
 
-                    # Iterate over the grid to process locked tiles
+                    # --- ASYNC OCR PROCESSING ---
+                    
+                    # 1. Collect completed OCR results (now includes confidence)
+                    for (r, c, letter, confidence) in self.ocr_service.get_results():
+                        # Only apply if cell is still locked (wasn't cancelled)
+                        if self.locked_cells[r, c] and self.board_state[r][c] is None:
+                            self.board_state[r][c] = (letter, confidence)
+                            print(f"Recognized {letter} (conf={confidence}) at ({r},{c})")
+                    
+                    # 2. Process cells - submit new OCR requests or cancel stale ones
                     for r in range(self.grid_size):
                         for c in range(self.grid_size):
                             
-                            # CASE 1: Cell is LOCKED but we don't have a letter yet
-                            if self.locked_cells[r, c] and self.board_state[r][c] == "":
-                                # Extract high-quality tile face
-                                tile_face = self.extract_tile_face(frame, r, c, output_size=(100, 100), margin_scale=0.1)
-                                if tile_face is not None:
-                                    letter, _ = self.recognize_tile(tile_face)
-                                    if letter != "?":
-                                        self.board_state[r][c] = letter
-                                        print(f"Recognized {letter} at ({r},{c})")
-                            
-                            # CASE 2: Cell is UNLOCKED (tile removed), clear the letter
-                            elif not self.locked_cells[r, c]:
-                                self.board_state[r][c] = ""
+                            if self.locked_cells[r, c]:
+                                # Cell is LOCKED - submit OCR if needed
+                                if self.board_state[r][c] is None and not self.ocr_service.is_pending(r, c):
+                                    # Extract tile face and submit for async OCR
+                                    tile_face = self.extract_tile_face(frame, r, c, output_size=(100, 100), margin_scale=0.1)
+                                    if tile_face is not None:
+                                        self.ocr_service.submit(tile_face, r, c)
+                            else:
+                                # Cell is UNLOCKED - cancel any pending OCR and clear letter
+                                self.ocr_service.cancel(r, c)
+                                self.board_state[r][c] = None
 
                     # Render the separate digital window
                     digital_board = self.draw_digital_board()
