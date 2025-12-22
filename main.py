@@ -56,7 +56,7 @@ class OCRService:
                     continue  # Stale request, skip
                 
                 # Perform OCR
-                letter, confidence = self._recognize_tile(tile_face)
+                letter, confidence, tile_clean = self._recognize_tile(tile_face)
                 
                 # Check again after OCR (cell might have unlocked during processing)
                 if self.pending.get((row, col)) != req_id:
@@ -65,19 +65,30 @@ class OCRService:
                 # Remove from pending and add to results
                 self.pending.pop((row, col), None)
                 if letter != "?":
-                    self.results.put((row, col, letter, confidence))
+                    self.results.put((row, col, letter, confidence, tile_clean))
                     
             except Exception as e:
                 print(f"OCR Worker Error: {e}")
     
     def _recognize_tile(self, tile_face):
-        """Detects the letter on a Scrabble tile. Returns (letter, confidence)."""
-        # Crop center to remove the small score number (bottom right)
+        """Detects the letter on a Scrabble tile. Returns (letter, confidence, processed_image)."""
         h, w = tile_face.shape[:2]
+        
+        # Cover the bottom-right score number with the tile's dominant color
+        # Get the dominant (median) color from the center of the tile
+        center_region = tile_face[h//4:3*h//4, w//4:3*w//4]
+        dominant_color = np.median(center_region.reshape(-1, 3), axis=0).astype(np.uint8)
+        
+        # Cover the bottom-right 25% x 25% corner with the dominant color
+        score_region_y = int(h * 0.75)
+        score_region_x = int(w * 0.75)
+        tile_clean = tile_face.copy()
+        tile_clean[score_region_y:, score_region_x:] = dominant_color
+        
+        # Crop margins to focus on the letter (avoid edges)
         margin_h = int(h * 0.15)
         margin_w = int(w * 0.15)
-        
-        roi = tile_face[margin_h:h-margin_h, margin_w:w-margin_w]
+        roi = tile_clean[margin_h:h-margin_h, margin_w:w-margin_w]
         
         # Pre-processing
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -104,12 +115,12 @@ class OCRService:
                     best_conf = conf
             
             if best_letter:
-                return (best_letter, best_conf)
+                return (best_letter, best_conf, tile_clean)
                 
         except Exception as e:
             print(f"OCR Error: {e}")
             
-        return ("?", 0)
+        return ("?", 0, tile_clean)
 
 class ScrabbleTracker:
     def __init__(self, video_path, manual_corners=None):
@@ -173,6 +184,9 @@ class ScrabbleTracker:
 
         # Board state stores tuples: (letter, confidence) or None for empty cells
         self.board_state = [[None for _ in range(self.grid_size)] for _ in range(self.grid_size)]
+        
+        # Cache of tile images sent to OCR: (row, col) -> tile_image
+        self.tile_image_cache = {}
         
         # Async OCR service
         self.ocr_service = OCRService()
@@ -249,6 +263,38 @@ class ScrabbleTracker:
                 # Visual feedback
                 cv2.circle(self.display_frame, (x, y), 5, (0, 0, 255), -1)
                 cv2.imshow('Mark 4 Corners', self.display_frame)
+
+    def on_board_click(self, event, x, y, flags, params):
+        """Handle clicks on the Digital Game State window to show cached tile images."""
+        if event == cv2.EVENT_LBUTTONDOWN:
+            # Calculate which cell was clicked
+            step_x = 450 // self.grid_size
+            step_y = 450 // self.grid_size
+            col = x // step_x
+            row = y // step_y
+            
+            # Bounds check
+            if 0 <= row < self.grid_size and 0 <= col < self.grid_size:
+                cell_data = self.board_state[row][col]
+                if cell_data is not None and (row, col) in self.tile_image_cache:
+                    letter, confidence = cell_data
+                    tile_img = self.tile_image_cache[(row, col)]
+                    
+                    # Scale up the tile image for better visibility
+                    display_size = (300, 300)
+                    tile_display = cv2.resize(tile_img, display_size, interpolation=cv2.INTER_NEAREST)
+                    
+                    # Add text overlay with detection info
+                    cv2.putText(tile_display, f"Cell: ({row},{col})", (10, 25), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    cv2.putText(tile_display, f"Letter: {letter}", (10, 55), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    cv2.putText(tile_display, f"Confidence: {confidence}%", (10, 85), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    
+                    cv2.imshow('Tile Debug View', tile_display)
+                else:
+                    print(f"No cached image for cell ({row},{col})")
 
     def initialize(self):
         ret, frame = self.cap.read()
@@ -565,11 +611,13 @@ class ScrabbleTracker:
 
                     # --- ASYNC OCR PROCESSING ---
                     
-                    # 1. Collect completed OCR results (now includes confidence)
-                    for (r, c, letter, confidence) in self.ocr_service.get_results():
+                    # 1. Collect completed OCR results (now includes confidence and processed image)
+                    for (r, c, letter, confidence, tile_clean) in self.ocr_service.get_results():
                         # Only apply if cell is still locked (wasn't cancelled)
                         if self.locked_cells[r, c] and self.board_state[r][c] is None:
                             self.board_state[r][c] = (letter, confidence)
+                            # Update cache with the processed image (score masked out)
+                            self.tile_image_cache[(r, c)] = tile_clean
                             print(f"Recognized {letter} (conf={confidence}) at ({r},{c})")
                     
                     # 2. Process cells - submit new OCR requests or cancel stale ones
@@ -582,15 +630,20 @@ class ScrabbleTracker:
                                     # Extract tile face and submit for async OCR
                                     tile_face = self.extract_tile_face(frame, r, c, output_size=(100, 100), margin_scale=0.1)
                                     if tile_face is not None:
+                                        # Cache the tile image for debugging
+                                        self.tile_image_cache[(r, c)] = tile_face.copy()
                                         self.ocr_service.submit(tile_face, r, c)
                             else:
                                 # Cell is UNLOCKED - cancel any pending OCR and clear letter
                                 self.ocr_service.cancel(r, c)
                                 self.board_state[r][c] = None
+                                # Remove from cache when cell is cleared
+                                self.tile_image_cache.pop((r, c), None)
 
                     # Render the separate digital window
                     digital_board = self.draw_digital_board()
                     cv2.imshow('Digital Game State', digital_board)
+                    cv2.setMouseCallback('Digital Game State', self.on_board_click)
 
                 # Draw the 15x15 grid (on top of overlays)
                 for i in range(1, self.grid_size):
