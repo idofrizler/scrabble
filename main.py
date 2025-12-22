@@ -9,30 +9,41 @@ import pytesseract
 
 
 class OCRService:
-    """Async OCR service that processes tile recognition in a background thread."""
+    """Async OCR service that processes tile recognition with multiple worker threads."""
+    
+    NUM_WORKERS = 4  # Number of parallel OCR workers
     
     def __init__(self):
         self.queue = queue.Queue()
         self.pending = {}  # (row, col) -> request_id
+        self.pending_lock = threading.Lock()  # Protect pending dict access
         self.request_counter = 0
         self.results = queue.Queue()  # Thread-safe results queue
-        self.worker = threading.Thread(target=self._process_loop, daemon=True)
-        self.worker.start()
+        
+        # Start worker pool
+        self.workers = []
+        for i in range(self.NUM_WORKERS):
+            worker = threading.Thread(target=self._process_loop, daemon=True, name=f"OCR-Worker-{i}")
+            worker.start()
+            self.workers.append(worker)
     
     def submit(self, tile_face, row, col):
         """Submit a tile for OCR processing."""
-        self.request_counter += 1
-        req_id = self.request_counter
-        self.pending[(row, col)] = req_id
+        with self.pending_lock:
+            self.request_counter += 1
+            req_id = self.request_counter
+            self.pending[(row, col)] = req_id
         self.queue.put((tile_face.copy(), row, col, req_id))
     
     def cancel(self, row, col):
         """Cancel pending OCR request for a cell (called when cell unlocks)."""
-        self.pending.pop((row, col), None)
+        with self.pending_lock:
+            self.pending.pop((row, col), None)
     
     def is_pending(self, row, col):
         """Check if there's a pending OCR request for this cell."""
-        return (row, col) in self.pending
+        with self.pending_lock:
+            return (row, col) in self.pending
     
     def get_results(self):
         """Get all available OCR results (non-blocking)."""
@@ -52,18 +63,22 @@ class OCRService:
                 tile_face, row, col, req_id = self.queue.get()
                 
                 # Check if request is still valid (not cancelled)
-                if self.pending.get((row, col)) != req_id:
-                    continue  # Stale request, skip
+                with self.pending_lock:
+                    if self.pending.get((row, col)) != req_id:
+                        continue  # Stale request, skip
                 
-                # Perform OCR
+                # Perform OCR (outside lock - this is the slow part)
                 letter, confidence, tile_clean = self._recognize_tile(tile_face)
                 
                 # Check again after OCR (cell might have unlocked during processing)
-                if self.pending.get((row, col)) != req_id:
-                    continue  # Request cancelled during OCR
+                with self.pending_lock:
+                    if self.pending.get((row, col)) != req_id:
+                        continue  # Request cancelled during OCR
+                    
+                    # Remove from pending
+                    self.pending.pop((row, col), None)
                 
-                # Remove from pending and add to results (include "?" results too)
-                self.pending.pop((row, col), None)
+                # Add to results (queue is already thread-safe)
                 self.results.put((row, col, letter, confidence, tile_clean))
                     
             except Exception as e:
