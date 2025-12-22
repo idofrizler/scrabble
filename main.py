@@ -24,6 +24,11 @@ class ScrabbleTracker:
         self.current_corners = None # The smoothed current position
         self.last_valid_matrix = None 
 
+        # New: 2D board representation
+        self.board_size = (450, 450)  # Width, Height of the 2D board
+        self.grid_size = 15
+        self.cell_size = self.board_size[0] // self.grid_size, self.board_size[1] // self.grid_size
+
     def click_event(self, event, x, y, flags, params):
         if event == cv2.EVENT_LBUTTONDOWN:
             if len(self.points) < 4:
@@ -76,6 +81,14 @@ class ScrabbleTracker:
         ALPHA = 0.4 
         # Max pixels the board corners are allowed to move in 1 frame before we call it a "glitch"
         MAX_SHIFT_THRESHOLD = 50.0 
+
+        # New: Define the destination corners for the 2D board
+        dst_corners = np.array([
+            [0, 0],
+            [self.board_size[0] - 1, 0],
+            [self.board_size[0] - 1, self.board_size[1] - 1],
+            [0, self.board_size[1] - 1]
+        ], dtype=np.float32)
 
         while True:
             ret, frame = self.cap.read()
@@ -144,6 +157,24 @@ class ScrabbleTracker:
 
             cv2.imshow('Scrabble Tracker', frame)
             
+            # New: Create and display the 2D board
+            if self.current_corners is not None:
+                # Get the perspective transform matrix
+                transform_matrix = cv2.getPerspectiveTransform(self.current_corners, dst_corners)
+                
+                # Warp the original frame to get the top-down 2D board
+                warped_board = cv2.warpPerspective(frame, transform_matrix, self.board_size)
+                
+                # Draw the 15x15 grid
+                for i in range(1, self.grid_size):
+                    # Vertical lines
+                    cv2.line(warped_board, (i * self.cell_size[0], 0), (i * self.cell_size[0], self.board_size[1]), (255, 255, 255), 1)
+                    # Horizontal lines
+                    cv2.line(warped_board, (0, i * self.cell_size[1]), (self.board_size[0], i * self.cell_size[1]), (255, 255, 255), 1)
+                
+                # Display the 2D board
+                cv2.imshow('2D Board', warped_board)
+
             if cv2.waitKey(1) & 0xFF == 27:
                 break
 
