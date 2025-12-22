@@ -72,7 +72,7 @@ class OCRService:
     def get_smart_tile_letter(self, tile_face):
             """
             Advanced preprocessing to isolate the letter from tile borders/shadows.
-            Strategy: Find the 'best' contour based on size + centrality, not just size.
+            Strategy: Find the 'best' contour based on size + centrality, preserving holes.
             """
             # 1. Grayscale
             if len(tile_face.shape) == 3:
@@ -91,18 +91,28 @@ class OCRService:
             kernel = np.ones((3,3), np.uint8)
             thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
 
-            # 4. Find Contours
-            cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # 4. Find Contours WITH HIERARCHY to preserve holes
+            # RETR_CCOMP: retrieves all contours and organizes them into a 2-level hierarchy
+            # (external contours and their holes)
+            cnts, hierarchy = cv2.findContours(thresh, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
             
-            if not cnts: return gray # Fail safe
+            if not cnts or hierarchy is None: 
+                return gray # Fail safe
 
-            best_cnt = None
+            hierarchy = hierarchy[0]  # Get actual hierarchy array
+            
+            best_cnt_idx = None
             max_score = 0
             
             # Center of the image
             center_x, center_y = w // 2, h // 2
 
-            for c in cnts:
+            for i, c in enumerate(cnts):
+                # Only consider top-level contours (parent == -1)
+                # hierarchy[i] = [next, prev, first_child, parent]
+                if hierarchy[i][3] != -1:
+                    continue  # This is a hole, not an outer contour
+                
                 # --- FILTER 1: BORDER TOUCHING ---
                 # If the contour touches the edge of the image (within 2px), it's likely a border artifact.
                 x, y, cw, ch = cv2.boundingRect(c)
@@ -138,14 +148,24 @@ class OCRService:
                     
                     if score > max_score:
                         max_score = score
-                        best_cnt = c
+                        best_cnt_idx = i
 
-            # 5. Draw the Winner
-            if best_cnt is not None:
+            # 5. Draw the Winner WITH HOLES PRESERVED
+            if best_cnt_idx is not None:
                 # Create a clean white canvas
                 clean_img = np.full_like(gray, 255)
-                # Draw the letter in BLACK
-                cv2.drawContours(clean_img, [best_cnt], -1, 0, -1)
+                
+                # Draw the outer contour filled in BLACK
+                cv2.drawContours(clean_img, cnts, best_cnt_idx, 0, -1)
+                
+                # Now find and draw holes (children of this contour) in WHITE
+                # to "cut out" the holes
+                child_idx = hierarchy[best_cnt_idx][2]  # first_child
+                while child_idx != -1:
+                    # Draw hole in WHITE to cut it out
+                    cv2.drawContours(clean_img, cnts, child_idx, 255, -1)
+                    child_idx = hierarchy[child_idx][0]  # next sibling
+                
                 return clean_img
             
             # If no valid letter found, return a blank white image (safest fallback)
