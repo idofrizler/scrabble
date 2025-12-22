@@ -399,6 +399,22 @@ class ScrabbleTracker:
                     cv2.putText(tile_display, f"Confidence: {confidence}%", (10, 85), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                     
+                    # Show last attempt time
+                    last_attempt = self.last_ocr_attempt_time.get((row, col), 0)
+                    if last_attempt > 0:
+                        current_time_ms = time.time() * 1000.0
+                        seconds_ago = (current_time_ms - last_attempt) / 1000.0
+                        cv2.putText(tile_display, f"Last try: {seconds_ago:.1f}s ago", (10, 115), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    else:
+                        cv2.putText(tile_display, f"Last try: N/A", (10, 115), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    
+                    # Show if pending
+                    is_pending = self.ocr_service.is_pending(row, col)
+                    cv2.putText(tile_display, f"Pending: {is_pending}", (10, 145), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255) if is_pending else (0, 255, 0), 2)
+                    
                     cv2.imshow('Tile Debug View', tile_display)
                 else:
                     print(f"No cached image for cell ({row},{col})")
