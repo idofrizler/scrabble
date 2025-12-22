@@ -3,6 +3,7 @@ import numpy as np
 import argparse
 import sys
 import time
+import pytesseract
 
 class ScrabbleTracker:
     def __init__(self, video_path, manual_corners=None):
@@ -41,6 +42,62 @@ class ScrabbleTracker:
         self.COLOR_CHANGE_THRESHOLD = 25.0  # LAB color difference threshold
         self.LOCK_IN_TIME_MS = 8000.0  # 8 seconds to lock
         self.UNLOCK_TIME_MS = 5000.0  # 5 seconds to unlock
+
+        # 3D Pose State
+        self.rvec = None
+        self.tvec = None
+        
+        # Camera Matrix (Approximate, assuming generic webcam)
+        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        focal_length = self.frame_width 
+        center = (self.frame_width/2, self.frame_height/2)
+        
+        self.camera_matrix = np.array(
+             [[focal_length, 0, center[0]],
+             [0, focal_length, center[1]],
+             [0, 0, 1]], dtype = "double"
+        )
+        self.dist_coeffs = np.zeros((4,1)) 
+
+        # Tile Geometry
+        # Scrabble tiles are ~19mm wide, ~4mm high. Ratio ~0.2
+        # Negative because we extrude "up" (Z- direction relative to board plane)
+        self.TILE_HEIGHT_RATIO = 0.25
+
+        self.board_state = [["" for _ in range(self.grid_size)] for _ in range(self.grid_size)]
+
+    def draw_digital_board(self):
+        """Creates a clean digital visualization of the board state."""
+        # Create a blank beige image (resembling a board)
+        board_img = np.zeros((450, 450, 3), dtype=np.uint8)
+        board_img[:] = (220, 245, 245) # Beige background (BGR)
+        
+        step_x = 450 // self.grid_size
+        step_y = 450 // self.grid_size
+
+        for row in range(self.grid_size):
+            for col in range(self.grid_size):
+                # Draw grid lines
+                x1 = col * step_x
+                y1 = row * step_y
+                cv2.rectangle(board_img, (x1, y1), (x1 + step_x, y1 + step_y), (150, 150, 150), 1)
+                
+                # Draw the letter if it exists
+                letter = self.board_state[row][col]
+                if letter:
+                    # Draw a tile background (wooden color)
+                    cv2.rectangle(board_img, (x1+2, y1+2), (x1 + step_x-2, y1 + step_y-2), (180, 210, 255), -1)
+                    
+                    # Center the text
+                    text_size = cv2.getTextSize(letter, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                    text_x = x1 + (step_x - text_size[0]) // 2
+                    text_y = y1 + (step_y + text_size[1]) // 2
+                    
+                    cv2.putText(board_img, letter, (text_x, text_y), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+        
+        return board_img
 
     def click_event(self, event, x, y, flags, params):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -201,6 +258,49 @@ class ScrabbleTracker:
         
         return result
 
+    def recognize_tile(self, tile_face):
+        """
+        Detects the letter on a Scrabble tile.
+        """
+        # 1. Crop center to remove the small score number (bottom right)
+        # We remove 15% from edges to isolate the big letter
+        h, w = tile_face.shape[:2]
+        margin_h = int(h * 0.15)
+        margin_w = int(w * 0.15)
+        
+        # Focus on the center-ish part
+        roi = tile_face[margin_h:h-margin_h, margin_w:w-margin_w]
+        
+        # 2. Pre-processing (Make it look like a scanned document)
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        
+        # Otsu's thresholding (Automatic black/white contrast)
+        # THRESH_BINARY_INV because Tesseract prefers black text on white background
+        # (Scrabble is usually black text on light wood, so usually standard Binary is fine, 
+        # but sometimes inverting helps if lighting is dark. Try both.)
+        thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        
+        # Optional: Denoise if video is grainy
+        thresh = cv2.medianBlur(thresh, 3)
+
+        # 3. OCR Config
+        # --psm 10: Treat the image as a single character
+        # whitelist: Only allow A-Z (ignores numbers and symbols)
+        custom_config = r'--psm 10 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        
+        try:
+            letter = pytesseract.image_to_string(thresh, config=custom_config)
+            clean_letter = letter.strip().upper()
+            
+            # Filter: ensure it's exactly 1 letter
+            if len(clean_letter) == 1 and clean_letter.isalpha():
+                return clean_letter, thresh # Return thresh for debug viewing
+                
+        except Exception as e:
+            print(f"OCR Error: {e}")
+            
+        return "?", thresh
+
     def process_video(self):
         # Smoothing factor (Lower = smoother but more lag, Higher = more responsive)
         ALPHA = 0.4 
@@ -268,6 +368,8 @@ class ScrabbleTracker:
                             # Apply Smoothing (Exponential Moving Average)
                             self.current_corners = (1 - ALPHA) * self.current_corners + ALPHA * new_corners
                             found_board = True
+
+                            self.update_3d_pose()
                         else:
                             # If shift is too huge, we treat it as a glitch and keep old corners
                             pass 
@@ -309,8 +411,37 @@ class ScrabbleTracker:
                     self.detect_cell_changes(warped_board, delta_ms)
                     
                     # Draw cell overlays (yellow for detecting, green for locked)
-                    warped_board = self.draw_cell_overlays(warped_board)
+                    warped_board_display = self.draw_cell_overlays(warped_board)
                 
+                    # Draw Grid Lines
+                    for i in range(1, self.grid_size):
+                        cv2.line(warped_board_display, (i*self.cell_size[0], 0), (i*self.cell_size[0], self.board_size[1]), (255,255,255), 1)
+                        cv2.line(warped_board_display, (0, i*self.cell_size[1]), (self.board_size[0], i*self.cell_size[1]), (255,255,255), 1)
+                    
+                    cv2.imshow('2D Board State', warped_board_display)
+
+                    # Iterate over the grid to process locked tiles
+                    for r in range(self.grid_size):
+                        for c in range(self.grid_size):
+                            
+                            # CASE 1: Cell is LOCKED but we don't have a letter yet
+                            if self.locked_cells[r, c] and self.board_state[r][c] == "":
+                                # Extract high-quality tile face
+                                tile_face = self.extract_tile_face(frame, r, c, output_size=(100, 100), margin_scale=0.1)
+                                if tile_face is not None:
+                                    letter, _ = self.recognize_tile(tile_face)
+                                    if letter != "?":
+                                        self.board_state[r][c] = letter
+                                        print(f"Recognized {letter} at ({r},{c})")
+                            
+                            # CASE 2: Cell is UNLOCKED (tile removed), clear the letter
+                            elif not self.locked_cells[r, c]:
+                                self.board_state[r][c] = ""
+
+                    # Render the separate digital window
+                    digital_board = self.draw_digital_board()
+                    cv2.imshow('Digital Game State', digital_board)
+
                 # Draw the 15x15 grid (on top of overlays)
                 for i in range(1, self.grid_size):
                     # Vertical lines
@@ -318,14 +449,71 @@ class ScrabbleTracker:
                     # Horizontal lines
                     cv2.line(warped_board, (0, i * self.cell_size[1]), (self.board_size[0], i * self.cell_size[1]), (255, 255, 255), 1)
                 
-                # Display the 2D board
-                cv2.imshow('2D Board', warped_board)
+                # Check locked cells and show the most recently locked one
+                rows, cols = np.where(self.locked_cells)
+                if len(rows) > 0:
+                    r, c = rows[-1], cols[-1] # Get last locked tile                        
 
             if cv2.waitKey(1) & 0xFF == 27:
                 break
 
         self.cap.release()
         cv2.destroyAllWindows()
+
+    def update_3d_pose(self):
+        """Calculates camera pose based on the 4 tracked board corners"""
+        if self.current_corners is None: return
+
+        # Real world coordinates of the board corners (Z=0)
+        # We use grid units: (0,0), (15,0), (15,15), (0,15)
+        obj_pts = np.array([
+            [0, 0, 0],
+            [self.grid_size, 0, 0],
+            [self.grid_size, self.grid_size, 0],
+            [0, self.grid_size, 0]
+        ], dtype=np.float32)
+
+        img_pts = self.current_corners.reshape(-1, 2).astype(np.float32)
+
+        # Solve PnP
+        ret, self.rvec, self.tvec = cv2.solvePnP(obj_pts, img_pts, self.camera_matrix, self.dist_coeffs)
+
+    def extract_tile_face(self, frame, row, col, output_size=(100, 100), margin_scale=0.2):
+        """
+        Extracts the tile face accounting for height (3D) to avoid perspective distortion.
+        """
+        if self.rvec is None or self.tvec is None:
+            return None
+
+        # Z is "up" out of the board. 
+        h_val = -1.0 * self.TILE_HEIGHT_RATIO 
+        
+        m = margin_scale / 2.0
+        
+        # 3D points of the tile TOP face
+        top_face_3d = np.array([
+            [col - m,     row - m,     h_val], # TL
+            [col + 1 + m, row - m,     h_val], # TR
+            [col + 1 + m, row + 1 + m, h_val], # BR
+            [col - m,     row + 1 + m, h_val]  # BL
+        ], dtype=np.float32)
+
+        # Project 3D points -> 2D Image pixels
+        image_points, _ = cv2.projectPoints(top_face_3d, self.rvec, self.tvec, self.camera_matrix, self.dist_coeffs)
+        image_points = image_points.reshape(-1, 2).astype(np.float32)
+
+        # Warp extracted quad to flat square
+        dst_pts = np.array([
+            [0, 0],
+            [output_size[0]-1, 0],
+            [output_size[0]-1, output_size[1]-1],
+            [0, output_size[1]-1]
+        ], dtype=np.float32)
+
+        M = cv2.getPerspectiveTransform(image_points, dst_pts)
+        tile_face = cv2.warpPerspective(frame, M, output_size)
+        
+        return tile_face
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Track Scrabble Board')
