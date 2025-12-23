@@ -287,6 +287,22 @@ class ScrabbleTracker:
         # Board state stores tuples: (letter, confidence) or None for empty cells
         self.board_state = [[None for _ in range(self.grid_size)] for _ in range(self.grid_size)]
         
+        # Turn management state
+        self.confirmed_board_state = [[None for _ in range(self.grid_size)] for _ in range(self.grid_size)]
+        self.previous_pending_tiles = set()  # For tracking stability
+        self.pending_stable_since = None  # Timestamp when pending tiles became stable
+        self.turn_number = 0
+        self.awaiting_confirmation = False
+        self.detected_words = []  # List of (word_cells, new_tile_mask) tuples
+        self.turn_error_message = None  # Error message to display
+        self.turn_error_time = None  # When error was set (for timeout)
+        self.PENDING_STABLE_TIME_MS = 5000.0  # 5 seconds of stability before validating
+        
+        # Confirmation UI dimensions
+        self.CONFIRM_PANEL_HEIGHT = 60
+        self.CONFIRM_BUTTON_WIDTH = 100
+        self.CANCEL_BUTTON_WIDTH = 100
+        
         # Cache of tile images sent to OCR: (row, col) -> tile_image
         self.tile_image_cache = {}
         
@@ -300,12 +316,27 @@ class ScrabbleTracker:
 
     def draw_digital_board(self):
         """Creates a clean digital visualization of the board state with confidence coloring."""
+        # Calculate total height including confirmation panel if needed
+        board_height = 450
+        total_height = board_height + (self.CONFIRM_PANEL_HEIGHT if self.awaiting_confirmation else 0)
+        
         # Create a blank beige image (resembling a board)
-        board_img = np.zeros((450, 450, 3), dtype=np.uint8)
-        board_img[:] = (220, 245, 245) # Beige background (BGR)
+        board_img = np.zeros((total_height, 450, 3), dtype=np.uint8)
+        board_img[:board_height] = (220, 245, 245)  # Beige background (BGR)
         
         step_x = 450 // self.grid_size
-        step_y = 450 // self.grid_size
+        step_y = board_height // self.grid_size
+
+        # Build set of cells that are part of detected words for highlighting
+        word_cells_new = set()  # New tiles in detected words
+        word_cells_existing = set()  # Existing tiles in detected words
+        if self.awaiting_confirmation and self.detected_words:
+            for word_cells, is_new_flags in self.detected_words:
+                for i, (r, c) in enumerate(word_cells):
+                    if is_new_flags[i]:
+                        word_cells_new.add((r, c))
+                    else:
+                        word_cells_existing.add((r, c))
 
         for row in range(self.grid_size):
             for col in range(self.grid_size):
@@ -360,6 +391,89 @@ class ScrabbleTracker:
                     conf_text = f"{confidence}"
                     cv2.putText(board_img, conf_text, (x1 + 3, y1 + step_y - 3), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.25, (80, 80, 80), 1)
+                    
+                    # Draw word highlight borders if awaiting confirmation
+                    if (row, col) in word_cells_new:
+                        # New tile - blue thick border
+                        cv2.rectangle(board_img, (x1+1, y1+1), (x1 + step_x-1, y1 + step_y-1), (255, 100, 0), 3)
+                    elif (row, col) in word_cells_existing:
+                        # Existing tile in word - orange border
+                        cv2.rectangle(board_img, (x1+1, y1+1), (x1 + step_x-1, y1 + step_y-1), (0, 165, 255), 2)
+        
+        # Draw confirmation panel if awaiting confirmation
+        if self.awaiting_confirmation:
+            panel_y = board_height
+            # Dark gray panel background
+            board_img[panel_y:] = (50, 50, 50)
+            
+            # Calculate button positions
+            button_gap = 20
+            total_buttons_width = self.CONFIRM_BUTTON_WIDTH + self.CANCEL_BUTTON_WIDTH + button_gap
+            start_x = (450 - total_buttons_width) // 2
+            
+            # Confirm button (green)
+            confirm_x1 = start_x
+            confirm_x2 = confirm_x1 + self.CONFIRM_BUTTON_WIDTH
+            confirm_y1 = panel_y + 10
+            confirm_y2 = panel_y + self.CONFIRM_PANEL_HEIGHT - 10
+            cv2.rectangle(board_img, (confirm_x1, confirm_y1), (confirm_x2, confirm_y2), (0, 180, 0), -1)
+            cv2.rectangle(board_img, (confirm_x1, confirm_y1), (confirm_x2, confirm_y2), (0, 220, 0), 2)
+            
+            # Confirm text
+            confirm_text = "Confirm"
+            text_size = cv2.getTextSize(confirm_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            text_x = confirm_x1 + (self.CONFIRM_BUTTON_WIDTH - text_size[0]) // 2
+            text_y = confirm_y1 + (self.CONFIRM_PANEL_HEIGHT - 20 + text_size[1]) // 2
+            cv2.putText(board_img, confirm_text, (text_x, text_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # Cancel button (red)
+            cancel_x1 = confirm_x2 + button_gap
+            cancel_x2 = cancel_x1 + self.CANCEL_BUTTON_WIDTH
+            cancel_y1 = confirm_y1
+            cancel_y2 = confirm_y2
+            cv2.rectangle(board_img, (cancel_x1, cancel_y1), (cancel_x2, cancel_y2), (0, 0, 180), -1)
+            cv2.rectangle(board_img, (cancel_x1, cancel_y1), (cancel_x2, cancel_y2), (0, 0, 220), 2)
+            
+            # Cancel text
+            cancel_text = "Cancel"
+            text_size = cv2.getTextSize(cancel_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            text_x = cancel_x1 + (self.CANCEL_BUTTON_WIDTH - text_size[0]) // 2
+            text_y = cancel_y1 + (self.CONFIRM_PANEL_HEIGHT - 20 + text_size[1]) // 2
+            cv2.putText(board_img, cancel_text, (text_x, text_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            
+            # Store button coordinates for click detection
+            self.confirm_button_rect = (confirm_x1, confirm_y1, confirm_x2, confirm_y2)
+            self.cancel_button_rect = (cancel_x1, cancel_y1, cancel_x2, cancel_y2)
+            
+            # Display word info
+            if self.detected_words:
+                words_text = []
+                for word_cells, is_new_flags in self.detected_words:
+                    word = "".join([self.board_state[r][c][0] for r, c in word_cells if self.board_state[r][c]])
+                    words_text.append(word)
+                info_text = f"Words: {', '.join(words_text)}"
+                cv2.putText(board_img, info_text, (10, panel_y + self.CONFIRM_PANEL_HEIGHT - 5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        
+        # Draw error message if present
+        if self.turn_error_message and self.turn_error_time:
+            current_time = time.time()
+            # Show error for 3 seconds
+            if current_time - self.turn_error_time < 3.0:
+                # Red background bar at top
+                cv2.rectangle(board_img, (0, 0), (450, 30), (0, 0, 150), -1)
+                cv2.putText(board_img, self.turn_error_message, (10, 22), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            else:
+                self.turn_error_message = None
+                self.turn_error_time = None
+        
+        # Draw turn number
+        turn_text = f"Turn: {self.turn_number}"
+        cv2.putText(board_img, turn_text, (380, 20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         
         return board_img
 
@@ -372,9 +486,25 @@ class ScrabbleTracker:
                 cv2.imshow('Mark 4 Corners', self.display_frame)
 
     def on_board_click(self, event, x, y, flags, params):
-        """Handle clicks on the Digital Game State window to show cached tile images."""
+        """Handle clicks on the Digital Game State window to show cached tile images or handle buttons."""
         if event == cv2.EVENT_LBUTTONDOWN:
-            # Calculate which cell was clicked
+            # Check if we're clicking on confirmation buttons
+            if self.awaiting_confirmation:
+                # Check Confirm button
+                if hasattr(self, 'confirm_button_rect'):
+                    x1, y1, x2, y2 = self.confirm_button_rect
+                    if x1 <= x <= x2 and y1 <= y <= y2:
+                        self.confirm_turn()
+                        return
+                
+                # Check Cancel button
+                if hasattr(self, 'cancel_button_rect'):
+                    x1, y1, x2, y2 = self.cancel_button_rect
+                    if x1 <= x <= x2 and y1 <= y <= y2:
+                        self.cancel_turn()
+                        return
+            
+            # Otherwise, handle cell clicks for tile debug view
             step_x = 450 // self.grid_size
             step_y = 450 // self.grid_size
             col = x // step_x
@@ -418,6 +548,45 @@ class ScrabbleTracker:
                     cv2.imshow('Tile Debug View', tile_display)
                 else:
                     print(f"No cached image for cell ({row},{col})")
+    
+    def confirm_turn(self):
+        """Confirm the current turn and update the confirmed board state."""
+        print(f"Turn {self.turn_number} confirmed!")
+        
+        # Copy current board state to confirmed state
+        for row in range(self.grid_size):
+            for col in range(self.grid_size):
+                if self.board_state[row][col] is not None:
+                    self.confirmed_board_state[row][col] = self.board_state[row][col]
+        
+        # Increment turn number
+        self.turn_number += 1
+        
+        # Reset turn tracking state
+        self.awaiting_confirmation = False
+        self.detected_words = []
+        self.previous_pending_tiles = set()
+        self.pending_stable_since = None
+        
+        print(f"Ready for turn {self.turn_number}")
+    
+    def cancel_turn(self):
+        """Cancel the current turn confirmation and continue tracking."""
+        print("Turn cancelled, continuing to track...")
+        self.awaiting_confirmation = False
+        self.detected_words = []
+        # Reset stability tracking so we can re-detect
+        self.pending_stable_since = None
+    
+    def get_word_string(self, word_cells):
+        """Convert a list of (row, col) cells to a word string."""
+        letters = []
+        for r, c in word_cells:
+            if self.board_state[r][c] is not None:
+                letters.append(self.board_state[r][c][0])
+            else:
+                letters.append('?')
+        return ''.join(letters)
 
     def initialize(self):
         ret, frame = self.cap.read()
@@ -569,6 +738,191 @@ class ScrabbleTracker:
                     cy = y1 + self.cell_size[1] // 2
         
         return result
+
+    def get_pending_tiles(self):
+        """Get tiles that are locked but not yet confirmed (new tiles this turn)."""
+        pending = set()
+        for row in range(self.grid_size):
+            for col in range(self.grid_size):
+                if self.locked_cells[row, col] and self.confirmed_board_state[row][col] is None:
+                    # Also check that we have a recognized letter
+                    if self.board_state[row][col] is not None:
+                        pending.add((row, col))
+        return pending
+    
+    def is_board_empty(self):
+        """Check if the confirmed board has no tiles."""
+        for row in range(self.grid_size):
+            for col in range(self.grid_size):
+                if self.confirmed_board_state[row][col] is not None:
+                    return False
+        return True
+    
+    def validate_turn_placement(self, pending_tiles):
+        """
+        Validate that pending tiles form a valid Scrabble placement.
+        Returns (is_valid, error_message_or_None).
+        Does NOT check if words are valid dictionary words.
+        """
+        if not pending_tiles:
+            return False, "No tiles placed"
+        
+        pending_list = list(pending_tiles)
+        
+        # Check 1: All tiles in a single row OR single column
+        rows = set(r for r, c in pending_list)
+        cols = set(c for r, c in pending_list)
+        
+        is_horizontal = len(rows) == 1
+        is_vertical = len(cols) == 1
+        
+        if not is_horizontal and not is_vertical:
+            return False, "Tiles must be in a single row or column"
+        
+        # Check 2: First turn must cover center (7, 7)
+        center = (7, 7)
+        if self.is_board_empty():
+            if center not in pending_tiles:
+                return False, "First word must cover center square"
+        else:
+            # Check 3: Must connect to existing tiles
+            connects = False
+            for (r, c) in pending_list:
+                # Check all 4 neighbors
+                for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < self.grid_size and 0 <= nc < self.grid_size:
+                        if self.confirmed_board_state[nr][nc] is not None:
+                            connects = True
+                            break
+                if connects:
+                    break
+            
+            if not connects:
+                # Also check if tiles fill gaps between existing tiles
+                # (e.g., placing tiles that extend through existing tiles)
+                if is_horizontal:
+                    row = pending_list[0][0]
+                    min_col = min(c for r, c in pending_list)
+                    max_col = max(c for r, c in pending_list)
+                    for c in range(min_col, max_col + 1):
+                        if self.confirmed_board_state[row][c] is not None:
+                            connects = True
+                            break
+                else:
+                    col = pending_list[0][1]
+                    min_row = min(r for r, c in pending_list)
+                    max_row = max(r for r, c in pending_list)
+                    for r in range(min_row, max_row + 1):
+                        if self.confirmed_board_state[r][col] is not None:
+                            connects = True
+                            break
+            
+            if not connects:
+                return False, "Must connect to existing tiles"
+        
+        # Check 4: Tiles must be contiguous (no gaps unless filled by existing tiles)
+        if is_horizontal:
+            row = pending_list[0][0]
+            min_col = min(c for r, c in pending_list)
+            max_col = max(c for r, c in pending_list)
+            for c in range(min_col, max_col + 1):
+                has_pending = (row, c) in pending_tiles
+                has_confirmed = self.confirmed_board_state[row][c] is not None
+                if not has_pending and not has_confirmed:
+                    return False, "Word has gaps"
+        else:
+            col = pending_list[0][1]
+            min_row = min(r for r, c in pending_list)
+            max_row = max(r for r, c in pending_list)
+            for r in range(min_row, max_row + 1):
+                has_pending = (r, col) in pending_tiles
+                has_confirmed = self.confirmed_board_state[r][col] is not None
+                if not has_pending and not has_confirmed:
+                    return False, "Word has gaps"
+        
+        return True, None
+    
+    def extract_formed_words(self, pending_tiles):
+        """
+        Extract all words formed by the pending tiles.
+        Returns list of tuples: (word_cells, is_new_tile_flags)
+        where word_cells is list of (row, col) and is_new_tile_flags is list of bools
+        """
+        if not pending_tiles:
+            return []
+        
+        pending_list = list(pending_tiles)
+        words = []
+        
+        # Determine orientation
+        rows = set(r for r, c in pending_list)
+        is_horizontal = len(rows) == 1
+        
+        # Helper to get letter at position (from board_state, includes both pending and confirmed)
+        def get_letter(r, c):
+            if self.board_state[r][c] is not None:
+                return self.board_state[r][c][0]
+            return None
+        
+        # Helper to extract a word in a direction
+        def extract_word_line(start_r, start_c, dr, dc):
+            """Extract word starting from position, going in direction, then extending backwards."""
+            cells = []
+            is_new = []
+            
+            # First, go backwards to find start of word
+            r, c = start_r, start_c
+            while True:
+                prev_r, prev_c = r - dr, c - dc
+                if 0 <= prev_r < self.grid_size and 0 <= prev_c < self.grid_size:
+                    if get_letter(prev_r, prev_c) is not None:
+                        r, c = prev_r, prev_c
+                        continue
+                break
+            
+            # Now go forward collecting the word
+            while 0 <= r < self.grid_size and 0 <= c < self.grid_size:
+                letter = get_letter(r, c)
+                if letter is None:
+                    break
+                cells.append((r, c))
+                is_new.append((r, c) in pending_tiles)
+                r, c = r + dr, c + dc
+            
+            return cells, is_new
+        
+        # 1. Extract the main word (along the line of placed tiles)
+        if is_horizontal:
+            # Main word is horizontal
+            row = pending_list[0][0]
+            main_cells, main_is_new = extract_word_line(row, pending_list[0][1], 0, 1)
+            if len(main_cells) > 1:
+                words.append((main_cells, main_is_new))
+        else:
+            # Main word is vertical
+            col = pending_list[0][1]
+            main_cells, main_is_new = extract_word_line(pending_list[0][0], col, 1, 0)
+            if len(main_cells) > 1:
+                words.append((main_cells, main_is_new))
+        
+        # 2. For each new tile, check for perpendicular words (cross-words)
+        for (r, c) in pending_list:
+            if is_horizontal:
+                # Check vertical cross-word
+                cross_cells, cross_is_new = extract_word_line(r, c, 1, 0)
+                if len(cross_cells) > 1:
+                    # Only add if not duplicate
+                    if (cross_cells, cross_is_new) not in words:
+                        words.append((cross_cells, cross_is_new))
+            else:
+                # Check horizontal cross-word
+                cross_cells, cross_is_new = extract_word_line(r, c, 0, 1)
+                if len(cross_cells) > 1:
+                    if (cross_cells, cross_is_new) not in words:
+                        words.append((cross_cells, cross_is_new))
+        
+        return words
 
     def recognize_tile(self, tile_face):
         """
@@ -787,6 +1141,39 @@ class ScrabbleTracker:
                                 self.tile_image_cache.pop((r, c), None)
                                 self.last_ocr_attempt_time.pop((r, c), None)
 
+                    # --- TURN DETECTION LOGIC ---
+                    if not self.awaiting_confirmation:
+                        # Get current pending tiles (locked but not confirmed)
+                        current_pending = self.get_pending_tiles()
+                        
+                        # Check if pending tiles have changed
+                        if current_pending != self.previous_pending_tiles:
+                            # Tiles changed - reset stability timer
+                            self.pending_stable_since = None
+                            self.previous_pending_tiles = current_pending.copy()
+                        elif current_pending:  # Tiles exist and haven't changed
+                            if self.pending_stable_since is None:
+                                # Start stability timer
+                                self.pending_stable_since = current_time_ms
+                            else:
+                                # Check if stable long enough
+                                stable_duration = current_time_ms - self.pending_stable_since
+                                if stable_duration >= self.PENDING_STABLE_TIME_MS:
+                                    # Time to validate!
+                                    is_valid, error_msg = self.validate_turn_placement(current_pending)
+                                    
+                                    if is_valid:
+                                        # Extract formed words and show confirmation
+                                        self.detected_words = self.extract_formed_words(current_pending)
+                                        self.awaiting_confirmation = True
+                                        print(f"Valid placement detected! Words: {[self.get_word_string(w) for w, _ in self.detected_words]}")
+                                    else:
+                                        # Invalid placement - show error and reset
+                                        self.turn_error_message = error_msg
+                                        self.turn_error_time = current_time
+                                        self.pending_stable_since = None  # Reset to try again
+                                        print(f"Invalid placement: {error_msg}")
+                    
                     # Render the separate digital window
                     digital_board = self.draw_digital_board()
                     cv2.imshow('Digital Game State', digital_board)
