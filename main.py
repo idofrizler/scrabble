@@ -1653,9 +1653,52 @@ class ScrabbleTracker:
         if abs(self.tile_obstruction_offset - old_offset) > 1:
             print(f"Tile obstruction offset: {self.tile_obstruction_offset}px (ignoring bottom {self.tile_obstruction_offset}px of each cell)")
 
+    def calculate_tile_vertical_shift(self):
+        """
+        Calculate the visual vertical shift (in grid units) caused by tile height
+        when viewing from an angle. This tells us how much the tile appears to shift
+        upward in its cell due to perspective.
+        
+        Returns the shift in grid units (0-1 range typically).
+        """
+        if self.rvec is None or self.tvec is None:
+            return 0.0
+        
+        # Use center of board for calculation
+        sample_row, sample_col = 7.5, 7.5
+        
+        # Point on the board surface (Z=0)
+        board_point = np.array([[sample_col, sample_row, 0]], dtype=np.float32)
+        
+        # Same XY point but on top of a tile
+        tile_top_point = np.array([[sample_col, sample_row, -self.TILE_HEIGHT_RATIO]], dtype=np.float32)
+        
+        # Project both points to 2D
+        board_proj, _ = cv2.projectPoints(board_point, self.rvec, self.tvec, self.camera_matrix, self.dist_coeffs)
+        tile_proj, _ = cv2.projectPoints(tile_top_point, self.rvec, self.tvec, self.camera_matrix, self.dist_coeffs)
+        
+        # Get the difference in Y (original image coordinates)
+        board_y = board_proj[0][0][1]
+        tile_y = tile_proj[0][0][1]
+        y_diff = board_y - tile_y  # Positive means tile appears higher
+        
+        # Convert to grid units by projecting a reference distance
+        # Project a point one grid unit down from sample point
+        next_row_point = np.array([[sample_col, sample_row + 1, 0]], dtype=np.float32)
+        next_row_proj, _ = cv2.projectPoints(next_row_point, self.rvec, self.tvec, self.camera_matrix, self.dist_coeffs)
+        grid_unit_in_pixels = abs(next_row_proj[0][0][1] - board_proj[0][0][1])
+        
+        if grid_unit_in_pixels > 0:
+            shift_in_grid_units = y_diff / grid_unit_in_pixels
+        else:
+            shift_in_grid_units = 0.0
+        
+        return shift_in_grid_units
+
     def extract_tile_face(self, frame, row, col, output_size=(100, 100), margin_scale=0.2):
         """
-        Extracts the tile face accounting for height (3D) to avoid perspective distortion.
+        Extracts the tile face accounting for height (3D) and perspective shift
+        to accurately capture the visible tile surface.
         """
         if self.rvec is None or self.tvec is None:
             return None
@@ -1665,12 +1708,22 @@ class ScrabbleTracker:
         
         m = margin_scale / 2.0
         
-        # 3D points of the tile TOP face
+        # Calculate the visual shift caused by perspective
+        # This adjusts where we look for the tile to account for the
+        # upward visual displacement when viewing at an angle
+        vertical_shift = self.calculate_tile_vertical_shift()
+        
+        # Apply the shift - move our extraction window upward to follow 
+        # where the tile visually appears. We use a portion of the shift
+        # to avoid over-correcting.
+        row_adjusted = row - (vertical_shift * 0.7)  # Use 70% of the shift
+        
+        # 3D points of the tile TOP face, with adjusted row position
         top_face_3d = np.array([
-            [col - m,     row - m,     h_val], # TL
-            [col + 1 + m, row - m,     h_val], # TR
-            [col + 1 + m, row + 1 + m, h_val], # BR
-            [col - m,     row + 1 + m, h_val]  # BL
+            [col - m,     row_adjusted - m,     h_val], # TL
+            [col + 1 + m, row_adjusted - m,     h_val], # TR
+            [col + 1 + m, row_adjusted + 1 + m, h_val], # BR
+            [col - m,     row_adjusted + 1 + m, h_val]  # BL
         ], dtype=np.float32)
 
         # Project 3D points -> 2D Image pixels
