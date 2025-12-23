@@ -1360,6 +1360,29 @@ class ScrabbleTracker:
                             pass 
 
             # --- VISUALIZATION ---
+            # Draw ORB features if enabled
+            if hasattr(self, 'show_orb') and self.show_orb and kp2 is not None:
+                # Draw all detected keypoints as small cyan dots
+                for kp in kp2:
+                    x, y = int(kp.pt[0]), int(kp.pt[1])
+                    cv2.circle(frame, (x, y), 2, (0, 255, 255), -1)
+                
+                # If we have matches, highlight the matched keypoints as small green dots
+                if des2 is not None and len(matches) > 0:
+                    for m in matches[:50]:  # Top 50 matches
+                        kp = kp2[m.trainIdx]
+                        x, y = int(kp.pt[0]), int(kp.pt[1])
+                        cv2.circle(frame, (x, y), 3, (0, 255, 0), -1)
+                
+                # Show ORB stats
+                cv2.putText(frame, f"ORB Features: {len(kp2)}", (20, 125), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                cv2.putText(frame, f"Ref Features: {len(self.ref_keypoints)}", (20, 145), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                if des2 is not None:
+                    cv2.putText(frame, f"Matches: {len(matches)}", (20, 165), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            
             # Draw the board
             color = (0, 255, 0) if found_board else (0, 0, 255) # Green if tracking, Red if lost/coasting
             cv2.polylines(frame, [np.int32(self.current_corners)], True, color, 3)
@@ -1589,6 +1612,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Track Scrabble Board')
     parser.add_argument('video_path', type=str, help='Path to video file')
     parser.add_argument('--corners', type=str, help='Comma separated coordinates: x1,y1,x2,y2,x3,y3,x4,y4', default=None)
+    parser.add_argument('--show-orb', action='store_true', help='Show ORB features for debugging')
     
     args = parser.parse_args()
     
@@ -1602,5 +1626,6 @@ if __name__ == "__main__":
             sys.exit(1)
 
     tracker = ScrabbleTracker(args.video_path, manual_corners)
+    tracker.show_orb = args.show_orb
     if tracker.initialize():
         tracker.process_video()
