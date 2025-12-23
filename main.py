@@ -1480,48 +1480,49 @@ class ScrabbleTracker:
                                 self.tile_image_cache.pop((r, c), None)
                                 self.last_ocr_attempt_time.pop((r, c), None)
 
-                    # --- TURN DETECTION LOGIC ---
-                    # Get current pending tiles (locked but not confirmed)
-                    current_pending = self.get_pending_tiles()
-                    
-                    if not self.awaiting_confirmation:
-                        # Check if pending tiles have changed
-                        if current_pending != self.previous_pending_tiles:
-                            # Tiles changed - reset stability timer
-                            self.pending_stable_since = None
-                            self.previous_pending_tiles = current_pending.copy()
-                        elif current_pending:  # Tiles exist and haven't changed
-                            if self.pending_stable_since is None:
-                                # Start stability timer
-                                self.pending_stable_since = current_time_ms
-                            else:
-                                # Check if stable long enough
-                                stable_duration = current_time_ms - self.pending_stable_since
-                                if stable_duration >= self.PENDING_STABLE_TIME_MS:
-                                    # Time to validate!
-                                    is_valid, error_msg = self.validate_turn_placement(current_pending)
-                                    
-                                    if is_valid:
-                                        # Extract formed words and show confirmation
-                                        self.detected_words = self.extract_formed_words(current_pending)
-                                        # Validate words against dictionary
-                                        self.validate_detected_words()
-                                        # Store word snapshot for change detection
-                                        self.last_word_snapshot = self.get_word_snapshot()
-                                        self.awaiting_confirmation = True
-                                        print(f"Valid placement detected! Words: {[self.get_word_string(w) for w, _ in self.detected_words]}")
-                                        for i, (word, is_valid_word, suggestions) in enumerate(self.word_validations):
-                                            status = "✓" if is_valid_word else "✗"
-                                            print(f"  {status} {word}: {suggestions if suggestions else 'OK'}")
-                                    else:
-                                        # Invalid placement - show error and reset
-                                        self.turn_error_message = error_msg
-                                        self.turn_error_time = current_time
-                                        self.pending_stable_since = None  # Reset to try again
-                                        print(f"Invalid placement: {error_msg}")
-                    else:
-                        # Already awaiting confirmation - check if we need to refresh
-                        self.check_and_refresh_words(current_pending)
+                    # --- TURN DETECTION LOGIC (only in turns mode) ---
+                    if hasattr(self, 'turns_mode') and self.turns_mode:
+                        # Get current pending tiles (locked but not confirmed)
+                        current_pending = self.get_pending_tiles()
+                        
+                        if not self.awaiting_confirmation:
+                            # Check if pending tiles have changed
+                            if current_pending != self.previous_pending_tiles:
+                                # Tiles changed - reset stability timer
+                                self.pending_stable_since = None
+                                self.previous_pending_tiles = current_pending.copy()
+                            elif current_pending:  # Tiles exist and haven't changed
+                                if self.pending_stable_since is None:
+                                    # Start stability timer
+                                    self.pending_stable_since = current_time_ms
+                                else:
+                                    # Check if stable long enough
+                                    stable_duration = current_time_ms - self.pending_stable_since
+                                    if stable_duration >= self.PENDING_STABLE_TIME_MS:
+                                        # Time to validate!
+                                        is_valid, error_msg = self.validate_turn_placement(current_pending)
+                                        
+                                        if is_valid:
+                                            # Extract formed words and show confirmation
+                                            self.detected_words = self.extract_formed_words(current_pending)
+                                            # Validate words against dictionary
+                                            self.validate_detected_words()
+                                            # Store word snapshot for change detection
+                                            self.last_word_snapshot = self.get_word_snapshot()
+                                            self.awaiting_confirmation = True
+                                            print(f"Valid placement detected! Words: {[self.get_word_string(w) for w, _ in self.detected_words]}")
+                                            for i, (word, is_valid_word, suggestions) in enumerate(self.word_validations):
+                                                status = "✓" if is_valid_word else "✗"
+                                                print(f"  {status} {word}: {suggestions if suggestions else 'OK'}")
+                                        else:
+                                            # Invalid placement - show error and reset
+                                            self.turn_error_message = error_msg
+                                            self.turn_error_time = current_time
+                                            self.pending_stable_since = None  # Reset to try again
+                                            print(f"Invalid placement: {error_msg}")
+                        else:
+                            # Already awaiting confirmation - check if we need to refresh
+                            self.check_and_refresh_words(current_pending)
                     
                     # Render the separate digital window
                     digital_board = self.draw_digital_board()
@@ -1613,6 +1614,7 @@ if __name__ == "__main__":
     parser.add_argument('video_path', type=str, help='Path to video file')
     parser.add_argument('--corners', type=str, help='Comma separated coordinates: x1,y1,x2,y2,x3,y3,x4,y4', default=None)
     parser.add_argument('--show-orb', action='store_true', help='Show ORB features for debugging')
+    parser.add_argument('--turns', action='store_true', help='Enable turn management mode (validates placement, requires confirmation)')
     
     args = parser.parse_args()
     
@@ -1627,5 +1629,10 @@ if __name__ == "__main__":
 
     tracker = ScrabbleTracker(args.video_path, manual_corners)
     tracker.show_orb = args.show_orb
+    tracker.turns_mode = args.turns
+    if args.turns:
+        print("Turn management mode ENABLED - tiles will require confirmation")
+    else:
+        print("Simple OCR mode - tiles are detected and displayed without turn validation")
     if tracker.initialize():
         tracker.process_video()
