@@ -5,13 +5,16 @@ import sys
 import time
 import threading
 import queue
+import re
+import os
 import pytesseract
+from rapidfuzz import fuzz, process
 
 
 class OCRService:
     """Async OCR service that processes tile recognition with multiple worker threads."""
     
-    NUM_WORKERS = 4  # Number of parallel OCR workers
+    NUM_WORKERS = 2  # Number of parallel OCR workers
     
     def __init__(self):
         self.queue = queue.Queue()
@@ -313,6 +316,120 @@ class ScrabbleTracker:
         
         # Async OCR service
         self.ocr_service = OCRService()
+        
+        # Dictionary for word validation
+        self.dictionary = set()
+        self.dictionary_by_length = {}  # length -> list of words (for pattern matching)
+        self.load_dictionary()
+        
+        # Word validation state (for confirmation UI)
+        self.word_validations = []  # List of (word_string, is_valid, suggestions)
+        self.selected_corrections = {}  # word_index -> selected_correction
+        self.MAX_SUGGESTIONS = 5  # Max suggestions to show
+        
+        # Manual word input state
+        self.manual_input_active = False
+        self.manual_input_word_idx = None
+        self.manual_input_text = ""
+
+    def load_dictionary(self):
+        """Load Scrabble dictionary from words.txt file."""
+        dict_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'words.txt')
+        
+        if not os.path.exists(dict_path):
+            print(f"Warning: Dictionary file not found at {dict_path}")
+            return
+        
+        try:
+            with open(dict_path, 'r') as f:
+                for line in f:
+                    word = line.strip().upper()
+                    if word and word.isalpha():
+                        self.dictionary.add(word)
+                        length = len(word)
+                        if length not in self.dictionary_by_length:
+                            self.dictionary_by_length[length] = []
+                        self.dictionary_by_length[length].append(word)
+            
+            print(f"Loaded {len(self.dictionary)} words from dictionary")
+        except Exception as e:
+            print(f"Error loading dictionary: {e}")
+    
+    def validate_word(self, word):
+        """
+        Validate a word against the dictionary.
+        Returns (is_valid, suggestions) where suggestions is a list of possible corrections.
+        """
+        word_upper = word.upper()
+        
+        # Check for exact match
+        if word_upper in self.dictionary:
+            return True, []
+        
+        # If word contains '?', find pattern matches
+        if '?' in word_upper:
+            suggestions = self.find_pattern_matches(word_upper)
+            return False, suggestions[:self.MAX_SUGGESTIONS]
+        
+        # Otherwise, find similar words using fuzzy matching
+        suggestions = self.find_similar_words(word_upper)
+        return False, suggestions[:self.MAX_SUGGESTIONS]
+    
+    def find_pattern_matches(self, pattern):
+        """
+        Find words that match a pattern with '?' as wildcard.
+        Example: 'C?T' matches 'CAT', 'COT', 'CUT', etc.
+        """
+        length = len(pattern)
+        if length not in self.dictionary_by_length:
+            return []
+        
+        # Convert pattern to regex
+        regex_pattern = '^' + pattern.replace('?', '.') + '$'
+        regex = re.compile(regex_pattern)
+        
+        matches = []
+        for word in self.dictionary_by_length[length]:
+            if regex.match(word):
+                matches.append(word)
+        
+        return matches
+    
+    def find_similar_words(self, word, max_distance=2):
+        """
+        Find words similar to the given word using fuzzy matching.
+        Returns list of (word, score) sorted by similarity.
+        """
+        length = len(word)
+        candidates = []
+        
+        # Search words of similar length
+        for l in range(max(2, length - 1), length + 2):
+            if l in self.dictionary_by_length:
+                candidates.extend(self.dictionary_by_length[l])
+        
+        if not candidates:
+            return []
+        
+        # Use rapidfuzz to find best matches
+        results = process.extract(word, candidates, scorer=fuzz.ratio, limit=self.MAX_SUGGESTIONS)
+        
+        # Return just the words (not scores)
+        return [match[0] for match in results if match[1] >= 60]  # 60% minimum similarity
+
+    def validate_detected_words(self):
+        """Validate all detected words and store results."""
+        self.word_validations = []
+        self.selected_corrections = {}
+        
+        for i, (word_cells, is_new_flags) in enumerate(self.detected_words):
+            word_string = self.get_word_string(word_cells)
+            is_valid, suggestions = self.validate_word(word_string)
+            self.word_validations.append((word_string, is_valid, suggestions))
+            
+            # If invalid and has exactly one suggestion, auto-select it
+            if not is_valid and len(suggestions) == 1:
+                self.selected_corrections[i] = suggestions[0]
 
     def draw_digital_board(self):
         """Creates a clean digital visualization of the board state with confidence coloring."""
@@ -447,15 +564,35 @@ class ScrabbleTracker:
             self.confirm_button_rect = (confirm_x1, confirm_y1, confirm_x2, confirm_y2)
             self.cancel_button_rect = (cancel_x1, cancel_y1, cancel_x2, cancel_y2)
             
-            # Display word info
-            if self.detected_words:
-                words_text = []
-                for word_cells, is_new_flags in self.detected_words:
-                    word = "".join([self.board_state[r][c][0] for r, c in word_cells if self.board_state[r][c]])
-                    words_text.append(word)
-                info_text = f"Words: {', '.join(words_text)}"
-                cv2.putText(board_img, info_text, (10, panel_y + self.CONFIRM_PANEL_HEIGHT - 5), 
+            # Display word validation info or manual input state
+            if self.manual_input_active and len(self.detected_words) > 0:
+                # Show manual input mode for main word
+                word_cells, _ = self.detected_words[0]
+                expected_len = len(word_cells)
+                detected_word = self.get_word_string(word_cells)
+                input_text = f"'{detected_word}' -> {self.manual_input_text}_"
+                cv2.putText(board_img, input_text, (10, panel_y + 25), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+                hint_text = f"Type word ({expected_len} letters) ENTER=confirm ESC=cancel"
+                cv2.putText(board_img, hint_text, (10, panel_y + self.CONFIRM_PANEL_HEIGHT - 5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+            elif self.word_validations:
+                # Show main word validation status
+                word, is_valid, suggestions = self.word_validations[0] if self.word_validations else ("", True, [])
+                if 0 in self.selected_corrections:
+                    word_display = f"{word} -> {self.selected_corrections[0]}"
+                elif is_valid:
+                    word_display = f"{word} [OK]"
+                elif suggestions:
+                    word_display = f"{word} ? (maybe: {suggestions[0]})"
+                else:
+                    word_display = f"{word} [?]"
+                
+                cv2.putText(board_img, word_display, (10, panel_y + 25), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                hint_text = "Type to override word"
+                cv2.putText(board_img, hint_text, (10, panel_y + self.CONFIRM_PANEL_HEIGHT - 5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.3, (150, 150, 150), 1)
         
         # Draw error message if present
         if self.turn_error_message and self.turn_error_time:
@@ -553,6 +690,36 @@ class ScrabbleTracker:
         """Confirm the current turn and update the confirmed board state."""
         print(f"Turn {self.turn_number} confirmed!")
         
+        # Collect all cells that are part of detected words
+        all_word_cells = set()
+        for word_cells, is_new_flags in self.detected_words:
+            for r, c in word_cells:
+                all_word_cells.add((r, c))
+        
+        # Apply corrections from selected words
+        for word_idx, correction in self.selected_corrections.items():
+            if word_idx < len(self.detected_words):
+                word_cells, is_new_flags = self.detected_words[word_idx]
+                # Apply each letter from the correction
+                for i, (r, c) in enumerate(word_cells):
+                    if i < len(correction):
+                        new_letter = correction[i]
+                        old_data = self.board_state[r][c]
+                        if old_data is not None:
+                            old_letter, old_conf = old_data
+                            if old_letter != new_letter:
+                                # Update to corrected letter with 100% confidence
+                                self.board_state[r][c] = (new_letter, 100)
+                                print(f"  Corrected ({r},{c}): {old_letter} -> {new_letter}")
+        
+        # Set ALL letters in confirmed words to 100% confidence
+        for r, c in all_word_cells:
+            if self.board_state[r][c] is not None:
+                letter, conf = self.board_state[r][c]
+                if conf < 100:
+                    self.board_state[r][c] = (letter, 100)
+                    print(f"  Confirmed ({r},{c}): {letter} -> 100%")
+        
         # Copy current board state to confirmed state
         for row in range(self.grid_size):
             for col in range(self.grid_size):
@@ -565,16 +732,88 @@ class ScrabbleTracker:
         # Reset turn tracking state
         self.awaiting_confirmation = False
         self.detected_words = []
+        self.word_validations = []
+        self.selected_corrections = {}
+        self.manual_input_active = False
+        self.manual_input_text = ""
         self.previous_pending_tiles = set()
         self.pending_stable_since = None
         
         print(f"Ready for turn {self.turn_number}")
+    
+    def handle_key_input(self, key):
+        """Handle keyboard input for manual word correction."""
+        if not self.awaiting_confirmation:
+            return
+        
+        # If manual input is active, handle typing
+        if self.manual_input_active:
+            if key == 27:  # ESC - cancel manual input
+                self.manual_input_active = False
+                self.manual_input_text = ""
+                print("Manual input cancelled")
+            elif key == 13 or key == 10:  # ENTER - confirm manual input
+                if self.manual_input_text and len(self.detected_words) > 0:
+                    # Apply to the main word (first word, index 0)
+                    word_cells, _ = self.detected_words[0]
+                    expected_len = len(word_cells)
+                    
+                    if len(self.manual_input_text) == expected_len:
+                        correction = self.manual_input_text.upper()
+                        self.selected_corrections[0] = correction
+                        
+                        # Immediately update board_state to show corrected letters
+                        for i, (r, c) in enumerate(word_cells):
+                            if i < len(correction):
+                                new_letter = correction[i]
+                                old_data = self.board_state[r][c]
+                                if old_data is not None:
+                                    old_letter, _ = old_data
+                                    if old_letter != new_letter:
+                                        # Update the display immediately with 100% confidence
+                                        self.board_state[r][c] = (new_letter, 100)
+                                        print(f"  Updated ({r},{c}): {old_letter} -> {new_letter}")
+                        
+                        # Update word_validations to reflect the correction
+                        if self.word_validations:
+                            old_word, _, suggestions = self.word_validations[0]
+                            self.word_validations[0] = (old_word, True, [])  # Mark as valid now
+                        
+                        print(f"Manual correction applied: {correction}")
+                        self.manual_input_active = False
+                        self.manual_input_text = ""
+                    else:
+                        print(f"Word length mismatch: expected {expected_len}, got {len(self.manual_input_text)}")
+                else:
+                    self.manual_input_active = False
+                    self.manual_input_text = ""
+            elif key == 8:  # BACKSPACE
+                self.manual_input_text = self.manual_input_text[:-1]
+            elif 32 <= key <= 126:  # Printable ASCII
+                char = chr(key).upper()
+                if char.isalpha():
+                    self.manual_input_text += char
+        else:
+            # Start manual input mode when user types any letter
+            if 65 <= key <= 90 or 97 <= key <= 122:  # A-Z or a-z
+                if len(self.detected_words) > 0:
+                    self.manual_input_active = True
+                    self.manual_input_text = chr(key).upper()
+                    word_cells, _ = self.detected_words[0]
+                    expected_len = len(word_cells)
+                    detected_word = self.get_word_string(word_cells)
+                    print(f"Manual edit for main word: '{detected_word}' ({expected_len} letters)")
+                    print(f"Type the correct word and press ENTER (or ESC to cancel)")
     
     def cancel_turn(self):
         """Cancel the current turn confirmation and continue tracking."""
         print("Turn cancelled, continuing to track...")
         self.awaiting_confirmation = False
         self.detected_words = []
+        self.word_validations = []
+        self.selected_corrections = {}
+        self.manual_input_active = False
+        self.manual_input_text = ""
         # Reset stability tracking so we can re-detect
         self.pending_stable_since = None
     
@@ -1165,8 +1404,13 @@ class ScrabbleTracker:
                                     if is_valid:
                                         # Extract formed words and show confirmation
                                         self.detected_words = self.extract_formed_words(current_pending)
+                                        # Validate words against dictionary
+                                        self.validate_detected_words()
                                         self.awaiting_confirmation = True
                                         print(f"Valid placement detected! Words: {[self.get_word_string(w) for w, _ in self.detected_words]}")
+                                        for i, (word, is_valid_word, suggestions) in enumerate(self.word_validations):
+                                            status = "✓" if is_valid_word else "✗"
+                                            print(f"  {status} {word}: {suggestions if suggestions else 'OK'}")
                                     else:
                                         # Invalid placement - show error and reset
                                         self.turn_error_message = error_msg
@@ -1191,8 +1435,15 @@ class ScrabbleTracker:
                 if len(rows) > 0:
                     r, c = rows[-1], cols[-1] # Get last locked tile                        
 
-            if cv2.waitKey(1) & 0xFF == 27:
-                break
+            # Handle keyboard input
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:  # ESC to quit (unless in manual input mode)
+                if self.manual_input_active:
+                    self.handle_key_input(27)
+                else:
+                    break
+            elif key != 255:  # Any other key
+                self.handle_key_input(key)
 
         self.cap.release()
         cv2.destroyAllWindows()
