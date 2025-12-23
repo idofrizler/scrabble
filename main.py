@@ -826,6 +826,83 @@ class ScrabbleTracker:
             else:
                 letters.append('?')
         return ''.join(letters)
+    
+    def get_word_snapshot(self):
+        """
+        Get a snapshot of current word state for change detection.
+        Returns dict with word strings and their lengths.
+        """
+        if not self.detected_words:
+            return {}
+        
+        snapshot = {}
+        for i, (word_cells, is_new_flags) in enumerate(self.detected_words):
+            word_str = self.get_word_string(word_cells)
+            # Store the word, its length, and count of '?' characters
+            snapshot[i] = {
+                'word': word_str,
+                'length': len(word_cells),
+                'unknown_count': word_str.count('?')
+            }
+        return snapshot
+    
+    def check_and_refresh_words(self, current_pending):
+        """
+        Check if words need to be refreshed due to:
+        1. Longer word detected (more tiles on same line)
+        2. OCR improvement (? replaced with letter, or higher confidence)
+        """
+        if not self.detected_words or not hasattr(self, 'last_word_snapshot'):
+            return
+        
+        needs_refresh = False
+        
+        # Check 1: More pending tiles than before (longer word possible)
+        if len(current_pending) > len(self.previous_pending_tiles):
+            # New tiles added - re-extract words to get longer version
+            needs_refresh = True
+            print("Word refresh: More tiles detected")
+        
+        # Check 2: Compare current word state with snapshot
+        if not needs_refresh:
+            current_snapshot = self.get_word_snapshot()
+            
+            for i, current_data in current_snapshot.items():
+                if i in self.last_word_snapshot:
+                    last_data = self.last_word_snapshot[i]
+                    
+                    # Check if word length increased
+                    if current_data['length'] > last_data['length']:
+                        needs_refresh = True
+                        print(f"Word refresh: Word {i} length increased {last_data['length']} -> {current_data['length']}")
+                        break
+                    
+                    # Check if unknown count decreased (OCR improved)
+                    if current_data['unknown_count'] < last_data['unknown_count']:
+                        needs_refresh = True
+                        print(f"Word refresh: Word {i} OCR improved (fewer ?)")
+                        break
+                    
+                    # Check if word changed (better OCR result)
+                    if current_data['word'] != last_data['word']:
+                        # Only refresh if the new word is "better" (fewer ? or different letters)
+                        if current_data['unknown_count'] <= last_data['unknown_count']:
+                            needs_refresh = True
+                            print(f"Word refresh: Word {i} changed '{last_data['word']}' -> '{current_data['word']}'")
+                            break
+        
+        if needs_refresh:
+            # Re-extract words and re-validate
+            self.detected_words = self.extract_formed_words(current_pending)
+            self.validate_detected_words()
+            self.last_word_snapshot = self.get_word_snapshot()
+            
+            # Clear manual input state since word changed
+            if self.manual_input_active:
+                self.manual_input_active = False
+                self.manual_input_text = ""
+            
+            print(f"Words refreshed: {[self.get_word_string(w) for w, _ in self.detected_words]}")
 
     def initialize(self):
         ret, frame = self.cap.read()
@@ -1381,10 +1458,10 @@ class ScrabbleTracker:
                                 self.last_ocr_attempt_time.pop((r, c), None)
 
                     # --- TURN DETECTION LOGIC ---
+                    # Get current pending tiles (locked but not confirmed)
+                    current_pending = self.get_pending_tiles()
+                    
                     if not self.awaiting_confirmation:
-                        # Get current pending tiles (locked but not confirmed)
-                        current_pending = self.get_pending_tiles()
-                        
                         # Check if pending tiles have changed
                         if current_pending != self.previous_pending_tiles:
                             # Tiles changed - reset stability timer
@@ -1406,6 +1483,8 @@ class ScrabbleTracker:
                                         self.detected_words = self.extract_formed_words(current_pending)
                                         # Validate words against dictionary
                                         self.validate_detected_words()
+                                        # Store word snapshot for change detection
+                                        self.last_word_snapshot = self.get_word_snapshot()
                                         self.awaiting_confirmation = True
                                         print(f"Valid placement detected! Words: {[self.get_word_string(w) for w, _ in self.detected_words]}")
                                         for i, (word, is_valid_word, suggestions) in enumerate(self.word_validations):
@@ -1417,6 +1496,9 @@ class ScrabbleTracker:
                                         self.turn_error_time = current_time
                                         self.pending_stable_since = None  # Reset to try again
                                         print(f"Invalid placement: {error_msg}")
+                    else:
+                        # Already awaiting confirmation - check if we need to refresh
+                        self.check_and_refresh_words(current_pending)
                     
                     # Render the separate digital window
                     digital_board = self.draw_digital_board()
