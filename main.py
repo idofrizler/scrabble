@@ -264,6 +264,9 @@ class ScrabbleTracker:
         self.COLOR_CHANGE_THRESHOLD = 25.0  # LAB color difference threshold
         self.LOCK_IN_TIME_MS = 8000.0  # 8 seconds to lock
         self.UNLOCK_TIME_MS = 5000.0  # 5 seconds to unlock
+        
+        # Perspective-based tile obstruction offset (pixels to ignore at bottom of each cell)
+        self.tile_obstruction_offset = 0  # Will be calculated based on board perspective
 
         # 3D Pose State
         self.rvec = None
@@ -943,8 +946,70 @@ class ScrabbleTracker:
         
         return True
 
+    def calculate_tile_obstruction_offset(self):
+        """
+        Calculate how many pixels at the bottom of each cell could be obstructed
+        by a tile in the cell below, based on the board's perspective angle.
+        
+        The key insight is that when viewing the board at an angle from above,
+        tiles have physical height that causes them to visually extend upward
+        into the cell above them in the warped 2D view.
+        
+        We calculate this by:
+        1. Using the 3D pose (rvec, tvec) to project two points on a tile's top surface
+        2. Comparing where those points appear vs. where they would appear on the board surface
+        3. The vertical difference tells us the pixel offset
+        """
+        if self.rvec is None or self.tvec is None:
+            return 0
+        
+        # Sample point: center of cell (7, 7) - the middle of the board
+        # We'll compare where a point on the board surface vs tile top surface projects
+        sample_row, sample_col = 7.5, 7.5  # Center of a cell
+        
+        # Point on the board surface (Z=0)
+        board_point = np.array([[sample_col, sample_row + 1, 0]], dtype=np.float32)  # Bottom edge of cell
+        
+        # Same XY point but on top of a tile (Z = -TILE_HEIGHT_RATIO, negative is "up")
+        tile_top_point = np.array([[sample_col, sample_row + 1, -self.TILE_HEIGHT_RATIO]], dtype=np.float32)
+        
+        # Project both points to 2D
+        board_proj, _ = cv2.projectPoints(board_point, self.rvec, self.tvec, self.camera_matrix, self.dist_coeffs)
+        tile_proj, _ = cv2.projectPoints(tile_top_point, self.rvec, self.tvec, self.camera_matrix, self.dist_coeffs)
+        
+        board_y = board_proj[0][0][1]
+        tile_y = tile_proj[0][0][1]
+        
+        # The difference in Y (in original image pixels) tells us how much the tile
+        # appears to extend upward. We need to convert this to warped board pixels.
+        
+        # To convert from original image pixels to warped board pixels, we need to
+        # consider the scale of the warped board relative to the original
+        
+        # Approximate scale: board_size / average_board_dimension_in_image
+        corners = self.current_corners.reshape(-1, 2)
+        # Calculate average vertical span in the original image
+        left_height = np.linalg.norm(corners[3] - corners[0])   # BL - TL
+        right_height = np.linalg.norm(corners[2] - corners[1])  # BR - TR
+        avg_height = (left_height + right_height) / 2
+        
+        # Scale factor: warped height / original height
+        scale = self.board_size[1] / avg_height
+        
+        # The offset in warped pixels
+        offset_pixels = abs(tile_y - board_y) * scale
+        
+        # Add a small buffer for safety
+        offset_pixels = int(offset_pixels * 1.2)
+        
+        # Clamp to reasonable range (0 to half cell height)
+        max_offset = self.cell_size[1] // 2
+        offset_pixels = min(max(0, offset_pixels), max_offset)
+        
+        return offset_pixels
+    
     def get_cell_average_color(self, warped_board_lab, row, col):
-        """Get the average LAB color of a specific cell."""
+        """Get the average LAB color of a specific cell, ignoring bottom portion that may be obstructed."""
         x1 = col * self.cell_size[0]
         y1 = row * self.cell_size[1]
         x2 = x1 + self.cell_size[0]
@@ -952,7 +1017,15 @@ class ScrabbleTracker:
         
         # Use center region of cell (avoid grid lines)
         margin = 3
-        cell_region = warped_board_lab[y1+margin:y2-margin, x1+margin:x2-margin]
+        
+        # Also ignore bottom portion that could be obstructed by tile in cell below
+        # The obstruction only affects cells that have a cell below them (row < 14)
+        bottom_margin = margin
+        if row < self.grid_size - 1:
+            # This cell could have its bottom obstructed by a tile in the cell below
+            bottom_margin = max(margin, self.tile_obstruction_offset)
+        
+        cell_region = warped_board_lab[y1+margin:y2-bottom_margin, x1+margin:x2-margin]
         
         if cell_region.size == 0:
             return np.array([0, 128, 128], dtype=np.float32)  # Default gray in LAB
@@ -1571,6 +1644,14 @@ class ScrabbleTracker:
 
         # Solve PnP
         ret, self.rvec, self.tvec = cv2.solvePnP(obj_pts, img_pts, self.camera_matrix, self.dist_coeffs)
+        
+        # Update tile obstruction offset based on new pose
+        old_offset = self.tile_obstruction_offset
+        self.tile_obstruction_offset = self.calculate_tile_obstruction_offset()
+        
+        # Only print if offset changed significantly
+        if abs(self.tile_obstruction_offset - old_offset) > 1:
+            print(f"Tile obstruction offset: {self.tile_obstruction_offset}px (ignoring bottom {self.tile_obstruction_offset}px of each cell)")
 
     def extract_tile_face(self, frame, row, col, output_size=(100, 100), margin_scale=0.2):
         """
