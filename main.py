@@ -228,6 +228,37 @@ class OCRService:
         return ("?", 0, clean_img_color)
 
 class ScrabbleTracker:
+    # Standard Scrabble letter point values
+    LETTER_VALUES = {
+        'A': 1, 'E': 1, 'I': 1, 'O': 1, 'U': 1, 'L': 1, 'N': 1, 'S': 1, 'T': 1, 'R': 1,
+        'D': 2, 'G': 2,
+        'B': 3, 'C': 3, 'M': 3, 'P': 3,
+        'F': 4, 'H': 4, 'V': 4, 'W': 4, 'Y': 4,
+        'K': 5,
+        'J': 8, 'X': 8,
+        'Q': 10, 'Z': 10
+    }
+    
+    # Special cells on standard 15x15 Scrabble board
+    # DL = Double Letter, TL = Triple Letter, DW = Double Word, TW = Triple Word
+    SPECIAL_CELLS = {
+        # Triple Word (red corners and edge midpoints)
+        'TW': {(0, 0), (0, 7), (0, 14), (7, 0), (7, 14), (14, 0), (14, 7), (14, 14)},
+        # Double Word (pink diagonals and center)
+        'DW': {(1, 1), (2, 2), (3, 3), (4, 4), (7, 7),
+               (1, 13), (2, 12), (3, 11), (4, 10),
+               (10, 4), (11, 3), (12, 2), (13, 1),
+               (10, 10), (11, 11), (12, 12), (13, 13)},
+        # Triple Letter (dark blue)
+        'TL': {(1, 5), (1, 9), (5, 1), (5, 5), (5, 9), (5, 13),
+               (9, 1), (9, 5), (9, 9), (9, 13), (13, 5), (13, 9)},
+        # Double Letter (light blue)
+        'DL': {(0, 3), (0, 11), (2, 6), (2, 8), (3, 0), (3, 7), (3, 14),
+               (6, 2), (6, 6), (6, 8), (6, 12), (7, 3), (7, 11),
+               (8, 2), (8, 6), (8, 8), (8, 12), (11, 0), (11, 7), (11, 14),
+               (12, 6), (12, 8), (14, 3), (14, 11)}
+    }
+    
     def __init__(self, video_path, manual_corners=None):
         self.cap = cv2.VideoCapture(video_path)
         self.points = []
@@ -305,7 +336,7 @@ class ScrabbleTracker:
         self.PENDING_STABLE_TIME_MS = 5000.0  # 5 seconds of stability before validating
         
         # Confirmation UI dimensions
-        self.CONFIRM_PANEL_HEIGHT = 60
+        self.CONFIRM_PANEL_HEIGHT = 90  # Increased to fit word info + buttons
         self.CONFIRM_BUTTON_WIDTH = 100
         self.CANCEL_BUTTON_WIDTH = 100
         
@@ -528,7 +559,12 @@ class ScrabbleTracker:
             # Dark gray panel background
             board_img[panel_y:] = (50, 50, 50)
             
-            # Calculate button positions
+            # Layout: Word info on top (first 35px), buttons below (remaining space)
+            word_area_height = 35
+            button_area_y = panel_y + word_area_height
+            button_height = 35
+            
+            # Calculate button positions (centered horizontally)
             button_gap = 20
             total_buttons_width = self.CONFIRM_BUTTON_WIDTH + self.CANCEL_BUTTON_WIDTH + button_gap
             start_x = (450 - total_buttons_width) // 2
@@ -536,18 +572,18 @@ class ScrabbleTracker:
             # Confirm button (green)
             confirm_x1 = start_x
             confirm_x2 = confirm_x1 + self.CONFIRM_BUTTON_WIDTH
-            confirm_y1 = panel_y + 10
-            confirm_y2 = panel_y + self.CONFIRM_PANEL_HEIGHT - 10
+            confirm_y1 = button_area_y + 5
+            confirm_y2 = confirm_y1 + button_height
             cv2.rectangle(board_img, (confirm_x1, confirm_y1), (confirm_x2, confirm_y2), (0, 180, 0), -1)
             cv2.rectangle(board_img, (confirm_x1, confirm_y1), (confirm_x2, confirm_y2), (0, 220, 0), 2)
             
             # Confirm text
             confirm_text = "Confirm"
-            text_size = cv2.getTextSize(confirm_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            text_size = cv2.getTextSize(confirm_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
             text_x = confirm_x1 + (self.CONFIRM_BUTTON_WIDTH - text_size[0]) // 2
-            text_y = confirm_y1 + (self.CONFIRM_PANEL_HEIGHT - 20 + text_size[1]) // 2
+            text_y = confirm_y1 + (button_height + text_size[1]) // 2
             cv2.putText(board_img, confirm_text, (text_x, text_y), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
             
             # Cancel button (red)
             cancel_x1 = confirm_x2 + button_gap
@@ -559,28 +595,28 @@ class ScrabbleTracker:
             
             # Cancel text
             cancel_text = "Cancel"
-            text_size = cv2.getTextSize(cancel_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            text_size = cv2.getTextSize(cancel_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
             text_x = cancel_x1 + (self.CANCEL_BUTTON_WIDTH - text_size[0]) // 2
-            text_y = cancel_y1 + (self.CONFIRM_PANEL_HEIGHT - 20 + text_size[1]) // 2
+            text_y = cancel_y1 + (button_height + text_size[1]) // 2
             cv2.putText(board_img, cancel_text, (text_x, text_y), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
             
             # Store button coordinates for click detection
             self.confirm_button_rect = (confirm_x1, confirm_y1, confirm_x2, confirm_y2)
             self.cancel_button_rect = (cancel_x1, cancel_y1, cancel_x2, cancel_y2)
             
-            # Display word validation info or manual input state
+            # Display word validation info or manual input state (in top area)
             if self.manual_input_active and len(self.detected_words) > 0:
                 # Show manual input mode for main word
                 word_cells, _ = self.detected_words[0]
                 expected_len = len(word_cells)
                 detected_word = self.get_word_string(word_cells)
                 input_text = f"'{detected_word}' -> {self.manual_input_text}_"
-                cv2.putText(board_img, input_text, (10, panel_y + 25), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+                cv2.putText(board_img, input_text, (10, panel_y + 15), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
                 hint_text = f"Type word ({expected_len} letters) ENTER=confirm ESC=cancel"
-                cv2.putText(board_img, hint_text, (10, panel_y + self.CONFIRM_PANEL_HEIGHT - 5), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+                cv2.putText(board_img, hint_text, (10, panel_y + 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.3, (150, 150, 150), 1)
             elif self.word_validations:
                 # Show main word validation status
                 word, is_valid, suggestions = self.word_validations[0] if self.word_validations else ("", True, [])
@@ -593,10 +629,10 @@ class ScrabbleTracker:
                 else:
                     word_display = f"{word} [?]"
                 
-                cv2.putText(board_img, word_display, (10, panel_y + 25), 
+                cv2.putText(board_img, word_display, (10, panel_y + 15), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
                 hint_text = "Type to override word"
-                cv2.putText(board_img, hint_text, (10, panel_y + self.CONFIRM_PANEL_HEIGHT - 5), 
+                cv2.putText(board_img, hint_text, (10, panel_y + 30), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.3, (150, 150, 150), 1)
         
         # Draw error message if present
@@ -612,10 +648,41 @@ class ScrabbleTracker:
                 self.turn_error_message = None
                 self.turn_error_time = None
         
-        # Draw turn number
-        turn_text = f"Turn: {self.turn_number}"
-        cv2.putText(board_img, turn_text, (380, 20), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        # Draw scoreboard and turn info (top right area)
+        if hasattr(self, 'player_scores') and hasattr(self, 'num_players'):
+            # Background for scoreboard
+            cv2.rectangle(board_img, (300, 0), (450, 25 + self.num_players * 18), (240, 240, 240), -1)
+            cv2.rectangle(board_img, (300, 0), (450, 25 + self.num_players * 18), (150, 150, 150), 1)
+            
+            # Turn number
+            turn_text = f"Turn {self.turn_number}"
+            cv2.putText(board_img, turn_text, (310, 15), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+            
+            # Player scores
+            for i in range(self.num_players):
+                y_pos = 32 + i * 18
+                
+                # Highlight current player
+                if i == self.current_player:
+                    cv2.rectangle(board_img, (302, y_pos - 12), (448, y_pos + 5), (180, 255, 180), -1)
+                    prefix = ">"
+                else:
+                    prefix = " "
+                
+                # Mark our player
+                if hasattr(self, 'our_player_index') and i == self.our_player_index:
+                    player_label = f"{prefix}P{i+1} (You): {self.player_scores[i]}"
+                else:
+                    player_label = f"{prefix}P{i+1}: {self.player_scores[i]}"
+                
+                cv2.putText(board_img, player_label, (310, y_pos), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
+        else:
+            # Fallback: just show turn number
+            turn_text = f"Turn: {self.turn_number}"
+            cv2.putText(board_img, turn_text, (380, 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         
         return board_img
 
@@ -716,7 +783,10 @@ class ScrabbleTracker:
     
     def confirm_turn(self):
         """Confirm the current turn and update the confirmed board state."""
-        print(f"Turn {self.turn_number} confirmed!")
+        # Get pending tiles for scoring
+        pending_tiles = self.get_pending_tiles()
+        
+        print(f"Turn {self.turn_number} confirmed by Player {self.current_player + 1}!")
         
         # Collect all cells that are part of detected words
         all_word_cells = set()
@@ -747,6 +817,20 @@ class ScrabbleTracker:
                 if conf < 100:
                     self.board_state[r][c] = (letter, 100)
                     print(f"  Confirmed ({r},{c}): {letter} -> 100%")
+        
+        # Calculate and add score for this turn
+        if hasattr(self, 'player_scores') and hasattr(self, 'current_player'):
+            turn_score, word_scores = self.calculate_turn_score(pending_tiles)
+            self.player_scores[self.current_player] += turn_score
+            
+            print(f"  Turn score: {turn_score}")
+            for word, score in word_scores:
+                print(f"    {word}: {score} pts")
+            print(f"  Player {self.current_player + 1} total: {self.player_scores[self.current_player]}")
+            
+            # Advance to next player
+            self.current_player = (self.current_player + 1) % self.num_players
+            print(f"  Next: Player {self.current_player + 1}'s turn")
         
         # Copy current board state to confirmed state
         for row in range(self.grid_size):
@@ -844,6 +928,65 @@ class ScrabbleTracker:
         self.manual_input_text = ""
         # Reset stability tracking so we can re-detect
         self.pending_stable_since = None
+    
+    def calculate_turn_score(self, pending_tiles):
+        """
+        Calculate the score for the current turn based on detected words.
+        
+        Scoring rules:
+        - Each letter has a point value (from LETTER_VALUES)
+        - Letter multipliers (DL, TL) only apply to newly placed tiles
+        - Word multipliers (DW, TW) only apply if a new tile is on that cell
+        - If all 7 tiles are used (bingo), add 50 bonus points
+        
+        Returns: (total_score, word_scores_list)
+        where word_scores_list is [(word_string, word_score), ...]
+        """
+        total_score = 0
+        word_scores = []
+        
+        for word_cells, is_new_flags in self.detected_words:
+            word_score = 0
+            word_multiplier = 1
+            word_string = ""
+            
+            for i, (r, c) in enumerate(word_cells):
+                cell_data = self.board_state[r][c]
+                if cell_data is None:
+                    continue
+                
+                letter = cell_data[0]
+                word_string += letter
+                
+                # Get base letter value
+                letter_value = self.LETTER_VALUES.get(letter, 0)
+                
+                # Apply letter multipliers only if this is a newly placed tile
+                if is_new_flags[i]:
+                    if (r, c) in self.SPECIAL_CELLS['DL']:
+                        letter_value *= 2
+                    elif (r, c) in self.SPECIAL_CELLS['TL']:
+                        letter_value *= 3
+                    
+                    # Check for word multipliers
+                    if (r, c) in self.SPECIAL_CELLS['DW']:
+                        word_multiplier *= 2
+                    elif (r, c) in self.SPECIAL_CELLS['TW']:
+                        word_multiplier *= 3
+                
+                word_score += letter_value
+            
+            # Apply word multiplier
+            word_score *= word_multiplier
+            word_scores.append((word_string, word_score))
+            total_score += word_score
+        
+        # Bingo bonus: +50 if all 7 tiles were used
+        if len(pending_tiles) == 7:
+            total_score += 50
+            print("BINGO! +50 bonus points!")
+        
+        return total_score, word_scores
     
     def get_word_string(self, word_cells):
         """Convert a list of (row, col) cells to a word string."""
@@ -1981,6 +2124,8 @@ if __name__ == "__main__":
     parser.add_argument('--corners', type=str, help='Comma separated coordinates: x1,y1,x2,y2,x3,y3,x4,y4', default=None)
     parser.add_argument('--show-orb', action='store_true', help='Show ORB features for debugging')
     parser.add_argument('--turns', action='store_true', help='Enable turn management mode (validates placement, requires confirmation)')
+    parser.add_argument('--players', type=int, default=2, help='Number of players (2-4)')
+    parser.add_argument('--our-turn', type=int, default=1, help='Which position our player is at (1-based: 1=first, 2=second, etc.)')
     
     args = parser.parse_args()
     
@@ -1996,8 +2141,18 @@ if __name__ == "__main__":
     tracker = ScrabbleTracker(args.video_path, manual_corners)
     tracker.show_orb = args.show_orb
     tracker.turns_mode = args.turns
+    
+    # Set up player configuration
+    num_players = max(2, min(4, args.players))  # Clamp to 2-4
+    our_turn = max(1, min(num_players, args.our_turn))  # Clamp to valid range
+    tracker.num_players = num_players
+    tracker.our_player_index = our_turn - 1  # Convert to 0-based
+    tracker.current_player = 0  # Start with player 1 (index 0)
+    tracker.player_scores = [0] * num_players
+    
     if args.turns:
         print("Turn management mode ENABLED - tiles will require confirmation")
+        print(f"Players: {num_players}, Our position: {our_turn} (0-based index: {tracker.our_player_index})")
     else:
         print("Simple OCR mode - tiles are detected and displayed without turn validation")
     if tracker.initialize():
