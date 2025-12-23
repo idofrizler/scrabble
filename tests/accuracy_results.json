@@ -1,0 +1,62 @@
+{
+  "test1": [
+    {
+      "timestamp": "2025-12-23T23:33:00.651502",
+      "overall_accuracy": 50.0,
+      "cell_precision": 100.0,
+      "cell_recall": 50.0,
+      "cell_f1": 66.7,
+      "ocr_accuracy": 100.0,
+      "expected_tiles": 2,
+      "ocr_correct": 1
+    }
+  ],
+  "test4": [
+    {
+      "timestamp": "2025-12-23T23:33:30.357764",
+      "overall_accuracy": 100.0,
+      "cell_precision": 100.0,
+      "cell_recall": 100.0,
+      "cell_f1": 100.0,
+      "ocr_accuracy": 100.0,
+      "expected_tiles": 4,
+      "ocr_correct": 4
+    }
+  ],
+  "test5": [
+    {
+      "timestamp": "2025-12-23T23:39:41.651001",
+      "overall_accuracy": 87.5,
+      "cell_precision": 100.0,
+      "cell_recall": 100.0,
+      "cell_f1": 100.0,
+      "ocr_accuracy": 87.5,
+      "expected_tiles": 24,
+      "ocr_correct": 21
+    }
+  ],
+  "test2": [
+    {
+      "timestamp": "2025-12-23T23:40:38.063965",
+      "overall_accuracy": 90.9,
+      "cell_precision": 100.0,
+      "cell_recall": 100.0,
+      "cell_f1": 100.0,
+      "ocr_accuracy": 90.9,
+      "expected_tiles": 11,
+      "ocr_correct": 10
+    }
+  ],
+  "test3": [
+    {
+      "timestamp": "2025-12-23T23:43:45.674785",
+      "overall_accuracy": 92.1,
+      "cell_precision": 100.0,
+      "cell_recall": 100.0,
+      "cell_f1": 100.0,
+      "ocr_accuracy": 92.1,
+      "expected_tiles": 38,
+      "ocr_correct": 35
+    }
+  ]
+}

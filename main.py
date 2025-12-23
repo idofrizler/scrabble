@@ -1381,6 +1381,172 @@ class ScrabbleTracker:
             
         return "?", thresh
 
+    def process_headless(self, progress_callback=None):
+        """
+        Process video without display, returning detection results.
+        Used for testing - runs as fast as possible.
+        
+        Args:
+            progress_callback: Optional function(frame_num, total_frames) for progress updates
+            
+        Returns:
+            dict with:
+                - 'locked_cells': set of (row, col) tuples for detected tiles
+                - 'board_state': 15x15 grid with (letter, confidence) or None
+                - 'corners': the corner coordinates used
+                - 'total_frames': number of frames processed
+        """
+        # Initialize timing
+        self.last_frame_time = time.time()
+        reference_captured = False
+        
+        # Destination corners for 2D board
+        dst_corners = np.array([
+            [0, 0],
+            [self.board_size[0] - 1, 0],
+            [self.board_size[0] - 1, self.board_size[1] - 1],
+            [0, self.board_size[1] - 1]
+        ], dtype=np.float32)
+        
+        # Smoothing parameters (same as process_video)
+        ALPHA = 0.4
+        MAX_SHIFT_THRESHOLD = 50.0
+        
+        total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        frame_num = 0
+        
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+            
+            frame_num += 1
+            if progress_callback:
+                progress_callback(frame_num, total_frames)
+            
+            frame_clean = frame.copy()
+            
+            # Calculate delta time
+            current_time = time.time()
+            delta_ms = (current_time - self.last_frame_time) * 1000.0
+            self.last_frame_time = current_time
+            
+            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            
+            # Feature Matching (ORB) - same as process_video
+            kp2, des2 = self.orb.detectAndCompute(frame_gray, None)
+            
+            if des2 is not None:
+                bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+                matches = bf.match(self.ref_descriptors, des2)
+                matches = sorted(matches, key=lambda x: x.distance)
+                
+                if len(matches) > 15:
+                    src_pts = np.float32([self.ref_keypoints[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+                    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+                    
+                    M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                    
+                    if M is not None:
+                        new_corners = cv2.perspectiveTransform(self.ref_corners, M)
+                        shift_metric = np.linalg.norm(new_corners - self.current_corners) / 4
+                        
+                        if shift_metric < MAX_SHIFT_THRESHOLD:
+                            self.current_corners = (1 - ALPHA) * self.current_corners + ALPHA * new_corners
+                            self.update_3d_pose()
+            
+            # Process 2D board
+            if self.current_corners is not None:
+                transform_matrix = cv2.getPerspectiveTransform(self.current_corners, dst_corners)
+                warped_board = cv2.warpPerspective(frame, transform_matrix, self.board_size)
+                
+                if not reference_captured:
+                    self.capture_reference_colors(warped_board)
+                    reference_captured = True
+                
+                if self.reference_cell_colors is not None:
+                    self.detect_cell_changes(warped_board, delta_ms)
+                    
+                    # Process OCR results
+                    current_time_ms = current_time * 1000.0
+                    
+                    for (r, c, letter, confidence, tile_clean) in self.ocr_service.get_results():
+                        if self.locked_cells[r, c]:
+                            existing = self.board_state[r][c]
+                            if existing is None:
+                                self.board_state[r][c] = (letter, confidence)
+                            elif confidence > existing[1]:
+                                self.board_state[r][c] = (letter, confidence)
+                    
+                    # Submit OCR requests for locked cells
+                    for r in range(self.grid_size):
+                        for c in range(self.grid_size):
+                            if self.locked_cells[r, c]:
+                                existing = self.board_state[r][c]
+                                needs_ocr = False
+                                
+                                if existing is None:
+                                    needs_ocr = True
+                                elif existing[1] < self.OCR_MIN_CONFIDENCE:
+                                    last_attempt = self.last_ocr_attempt_time.get((r, c), 0)
+                                    if current_time_ms - last_attempt >= self.OCR_RETRY_INTERVAL_MS:
+                                        needs_ocr = True
+                                
+                                if needs_ocr and not self.ocr_service.is_pending(r, c):
+                                    tile_face = self.extract_tile_face(frame_clean, r, c, output_size=(100, 100), margin_scale=0.1)
+                                    if tile_face is not None:
+                                        self.last_ocr_attempt_time[(r, c)] = current_time_ms
+                                        self.ocr_service.submit(tile_face, r, c)
+                            else:
+                                self.ocr_service.cancel(r, c)
+                                self.board_state[r][c] = None
+        
+        # Wait for pending OCR to complete (with timeout)
+        timeout_start = time.time()
+        while time.time() - timeout_start < 5.0:  # 5 second timeout
+            # Check if any OCR still pending
+            any_pending = False
+            for r in range(self.grid_size):
+                for c in range(self.grid_size):
+                    if self.ocr_service.is_pending(r, c):
+                        any_pending = True
+                        break
+                if any_pending:
+                    break
+            
+            if not any_pending:
+                break
+            
+            # Process any completed results
+            for (r, c, letter, confidence, tile_clean) in self.ocr_service.get_results():
+                if self.locked_cells[r, c]:
+                    existing = self.board_state[r][c]
+                    if existing is None:
+                        self.board_state[r][c] = (letter, confidence)
+                    elif confidence > existing[1]:
+                        self.board_state[r][c] = (letter, confidence)
+            
+            time.sleep(0.1)
+        
+        # Collect final results
+        locked_cells_set = set()
+        for r in range(self.grid_size):
+            for c in range(self.grid_size):
+                if self.locked_cells[r, c]:
+                    locked_cells_set.add((r, c))
+        
+        # Convert corners to list format for JSON serialization
+        corners_list = [int(x) for pt in self.points for x in pt]
+        
+        self.cap.release()
+        
+        return {
+            'locked_cells': locked_cells_set,
+            'board_state': self.board_state,
+            'corners': corners_list,
+            'total_frames': frame_num
+        }
+
     def process_video(self):
         # Smoothing factor (Lower = smoother but more lag, Higher = more responsive)
         ALPHA = 0.4 
@@ -1654,6 +1820,44 @@ class ScrabbleTracker:
 
         self.cap.release()
         cv2.destroyAllWindows()
+        
+        # Print final board state as 2D grid
+        self.print_board_state()
+    
+    def print_board_state(self):
+        """Print the current board state as a 2D grid to console."""
+        # Count tiles
+        tile_count = sum(1 for r in range(self.grid_size) for c in range(self.grid_size) 
+                        if self.board_state[r][c] is not None)
+        
+        if tile_count == 0:
+            print("\nNo tiles detected on board.")
+            return
+        
+        print(f"\n=== Final Board State ({tile_count} tiles) ===")
+        print("     " + " ".join(f"{i:2}" for i in range(self.grid_size)))
+        print("    +" + "-" * 46 + "+")
+        
+        for row in range(self.grid_size):
+            row_letters = []
+            for col in range(self.grid_size):
+                cell = self.board_state[row][col]
+                if cell:
+                    row_letters.append(f" {cell[0]}")
+                else:
+                    row_letters.append(" .")
+            print(f"  {row:2} |" + " ".join(row_letters) + " |")
+        
+        print("    +" + "-" * 46 + "+")
+        
+        # Print tile details with confidence
+        print(f"\nTile details:")
+        for row in range(self.grid_size):
+            for col in range(self.grid_size):
+                cell = self.board_state[row][col]
+                if cell:
+                    letter, conf = cell
+                    print(f"  ({row:2},{col:2}): {letter} (conf={conf})")
 
     def update_3d_pose(self):
         """Calculates camera pose based on the 4 tracked board corners"""
