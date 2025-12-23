@@ -309,8 +309,10 @@ class ScrabbleTracker:
         self.CONFIRM_BUTTON_WIDTH = 100
         self.CANCEL_BUTTON_WIDTH = 100
         
-        # Cache of tile images sent to OCR: (row, col) -> tile_image
+        # Cache of tile images sent to OCR: (row, col) -> processed tile_image
         self.tile_image_cache = {}
+        # Cache of original tile captures (before processing): (row, col) -> original tile_image
+        self.tile_original_cache = {}
         
         # OCR retry tracking: (row, col) -> last_attempt_time
         self.last_ocr_attempt_time = {}
@@ -656,34 +658,57 @@ class ScrabbleTracker:
                 if cell_data is not None and (row, col) in self.tile_image_cache:
                     letter, confidence = cell_data
                     tile_img = self.tile_image_cache[(row, col)]
+                    original_img = self.tile_original_cache.get((row, col))
                     
-                    # Scale up the tile image for better visibility
-                    display_size = (300, 300)
-                    tile_display = cv2.resize(tile_img, display_size, interpolation=cv2.INTER_NEAREST)
+                    # Scale up tile images for better visibility
+                    tile_size = (150, 150)
+                    processed_display = cv2.resize(tile_img, tile_size, interpolation=cv2.INTER_NEAREST)
                     
-                    # Add text overlay with detection info
-                    cv2.putText(tile_display, f"Cell: ({row},{col})", (10, 25), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    cv2.putText(tile_display, f"Letter: {letter}", (10, 55), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                    cv2.putText(tile_display, f"Confidence: {confidence}%", (10, 85), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    # Create combined display with original (if available) and processed
+                    if original_img is not None:
+                        original_display = cv2.resize(original_img, tile_size, interpolation=cv2.INTER_NEAREST)
+                        # Stack horizontally: original | processed
+                        combined_tiles = np.hstack([original_display, processed_display])
+                    else:
+                        # Only processed available
+                        combined_tiles = processed_display
+                    
+                    # Create display with info panel below tiles
+                    info_height = 120
+                    display_width = combined_tiles.shape[1]
+                    tile_display = np.zeros((tile_size[1] + info_height, display_width, 3), dtype=np.uint8)
+                    tile_display[:tile_size[1], :] = combined_tiles
+                    
+                    # Add labels above tiles
+                    if original_img is not None:
+                        cv2.putText(tile_display, "Original", (10, 20), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        cv2.putText(tile_display, "Processed", (tile_size[0] + 10, 20), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    else:
+                        cv2.putText(tile_display, "Processed", (10, 20), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    
+                    # Add text overlay with detection info (in info panel)
+                    info_y_start = tile_size[1] + 20
+                    cv2.putText(tile_display, f"Cell: ({row},{col})  Letter: {letter}  Conf: {confidence}%", 
+                               (10, info_y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                     
                     # Show last attempt time
                     last_attempt = self.last_ocr_attempt_time.get((row, col), 0)
                     if last_attempt > 0:
                         current_time_ms = time.time() * 1000.0
                         seconds_ago = (current_time_ms - last_attempt) / 1000.0
-                        cv2.putText(tile_display, f"Last try: {seconds_ago:.1f}s ago", (10, 115), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                        cv2.putText(tile_display, f"Last try: {seconds_ago:.1f}s ago", (10, info_y_start + 30), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                     else:
-                        cv2.putText(tile_display, f"Last try: N/A", (10, 115), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                        cv2.putText(tile_display, f"Last try: N/A", (10, info_y_start + 30), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                     
                     # Show if pending
                     is_pending = self.ocr_service.is_pending(row, col)
-                    cv2.putText(tile_display, f"Pending: {is_pending}", (10, 145), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255) if is_pending else (0, 255, 0), 2)
+                    cv2.putText(tile_display, f"Pending: {is_pending}", (10, info_y_start + 60), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255) if is_pending else (0, 255, 0), 1)
                     
                     cv2.imshow('Tile Debug View', tile_display)
                 else:
@@ -1545,12 +1570,15 @@ class ScrabbleTracker:
                                     tile_face = self.extract_tile_face(frame_clean, r, c, output_size=(100, 100), margin_scale=0.1)
                                     if tile_face is not None:
                                         self.last_ocr_attempt_time[(r, c)] = current_time_ms
+                                        # Cache the original tile capture (before OCR processing)
+                                        self.tile_original_cache[(r, c)] = tile_face.copy()
                                         self.ocr_service.submit(tile_face, r, c)
                             else:
                                 # Cell is UNLOCKED - cancel any pending OCR and clear state
                                 self.ocr_service.cancel(r, c)
                                 self.board_state[r][c] = None
                                 self.tile_image_cache.pop((r, c), None)
+                                self.tile_original_cache.pop((r, c), None)
                                 self.last_ocr_attempt_time.pop((r, c), None)
 
                     # --- TURN DETECTION LOGIC (only in turns mode) ---
