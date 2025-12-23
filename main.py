@@ -786,6 +786,30 @@ class ScrabbleTracker:
         # Get pending tiles for scoring
         pending_tiles = self.get_pending_tiles()
         
+        # If manual input is active and valid, apply it before confirming
+        if self.manual_input_active and self.manual_input_text and len(self.detected_words) > 0:
+            word_cells, _ = self.detected_words[0]
+            expected_len = len(word_cells)
+            
+            if len(self.manual_input_text) == expected_len:
+                correction = self.manual_input_text.upper()
+                self.selected_corrections[0] = correction
+                
+                # Update board_state with the correction
+                for i, (r, c) in enumerate(word_cells):
+                    if i < len(correction):
+                        new_letter = correction[i]
+                        old_data = self.board_state[r][c]
+                        if old_data is not None:
+                            old_letter, _ = old_data
+                            if old_letter != new_letter:
+                                self.board_state[r][c] = (new_letter, 100)
+                                print(f"  Applied pending input ({r},{c}): {old_letter} -> {new_letter}")
+                
+                print(f"Applied in-progress manual input: {correction}")
+            else:
+                print(f"Warning: Pending input '{self.manual_input_text}' has wrong length (expected {expected_len})")
+        
         print(f"Turn {self.turn_number} confirmed by Player {self.current_player + 1}!")
         
         # Collect all cells that are part of detected words
