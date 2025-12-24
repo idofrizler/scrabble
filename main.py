@@ -11,18 +11,77 @@ import uuid
 import pytesseract
 from rapidfuzz import fuzz, process
 
+# PyTorch imports for CNN model (optional - used when not using Tesseract)
+try:
+    import torch
+    import torch.nn as nn
+    from torchvision import transforms
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
+
+# CNN model for tile recognition (same architecture as train_scrabble.py)
+class ScrabbleNet(nn.Module):
+    """CNN for recognizing Scrabble tile letters."""
+    
+    IMG_SIZE = 64  # Must match training
+    CLASSES = ['A', 'B', 'BLANK', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 
+               'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']
+    
+    def __init__(self, num_classes=27):
+        super(ScrabbleNet, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2)
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 8 * 8, 128),  # 64/8 = 8
+            nn.ReLU(),
+            nn.Linear(128, num_classes)
+        )
+    
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
 
 class OCRService:
     """Async OCR service that processes tile recognition with multiple worker threads."""
     
     NUM_WORKERS = 2  # Number of parallel OCR workers
     
-    def __init__(self):
+    def __init__(self, use_tesseract=False, model_path="scrabble_net.pth"):
         self.queue = queue.Queue()
         self.pending = {}  # (row, col) -> request_id
         self.pending_lock = threading.Lock()  # Protect pending dict access
         self.request_counter = 0
         self.results = queue.Queue()  # Thread-safe results queue
+        
+        # OCR backend selection
+        self.use_tesseract = use_tesseract
+        self.cnn_model = None
+        self.cnn_transform = None
+        
+        # Load CNN model if not using Tesseract
+        if not use_tesseract:
+            if not TORCH_AVAILABLE:
+                print("Warning: PyTorch not available, falling back to Tesseract")
+                self.use_tesseract = True
+            else:
+                self._load_cnn_model(model_path)
+        
+        backend_name = "Tesseract" if self.use_tesseract else "CNN"
+        print(f"OCR backend: {backend_name}")
         
         # Start worker pool
         self.workers = []
@@ -30,6 +89,49 @@ class OCRService:
             worker = threading.Thread(target=self._process_loop, daemon=True, name=f"OCR-Worker-{i}")
             worker.start()
             self.workers.append(worker)
+    
+    def _load_cnn_model(self, model_path):
+        """Load the CNN model for tile recognition."""
+        import os
+        
+        # Check if model file exists
+        if not os.path.exists(model_path):
+            print(f"Warning: CNN model not found at {model_path}, falling back to Tesseract")
+            self.use_tesseract = True
+            return
+        
+        try:
+            # Determine best available device
+            if torch.backends.mps.is_available():
+                self.device = torch.device("mps")
+                device_name = "MPS (Apple Silicon)"
+            elif torch.cuda.is_available():
+                self.device = torch.device("cuda")
+                device_name = "CUDA"
+            else:
+                self.device = torch.device("cpu")
+                device_name = "CPU"
+            
+            # Load model
+            self.cnn_model = ScrabbleNet(num_classes=len(ScrabbleNet.CLASSES))
+            self.cnn_model.load_state_dict(torch.load(model_path, map_location=self.device))
+            self.cnn_model.to(self.device)
+            self.cnn_model.eval()
+            
+            # Set up image transform (grayscale, resize, normalize)
+            self.cnn_transform = transforms.Compose([
+                transforms.ToPILImage(),
+                transforms.Grayscale(num_output_channels=1),
+                transforms.Resize((ScrabbleNet.IMG_SIZE, ScrabbleNet.IMG_SIZE)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5], std=[0.5])
+            ])
+            
+            print(f"CNN model loaded from {model_path} (device: {device_name})")
+        except Exception as e:
+            print(f"Error loading CNN model: {e}, falling back to Tesseract")
+            self.use_tesseract = True
+            self.cnn_model = None
     
     def submit(self, tile_face, row, col):
         """Submit a tile for OCR processing."""
@@ -192,6 +294,74 @@ class OCRService:
 
     def _recognize_tile(self, tile_face):
         """Detects the letter on a Scrabble tile. Returns (letter, confidence, processed_image)."""
+        if self.use_tesseract:
+            return self._recognize_tile_tesseract(tile_face)
+        else:
+            return self._recognize_tile_cnn(tile_face)
+    
+    def _recognize_tile_cnn(self, tile_face):
+        """Recognize tile using CNN model. Returns (letter, confidence, processed_image)."""
+        try:
+            # Prepare image for CNN
+            # The model expects 64x64 grayscale, normalized
+            img_tensor = self.cnn_transform(tile_face)
+            img_tensor = img_tensor.unsqueeze(0)  # Add batch dimension
+            img_tensor = img_tensor.to(self.device)  # Move to GPU/MPS if available
+            
+            # Run inference
+            with torch.no_grad():
+                outputs = self.cnn_model(img_tensor)
+                probabilities = torch.nn.functional.softmax(outputs, dim=1)
+                
+                # Get top 2 predictions
+                top2_probs, top2_indices = torch.topk(probabilities, 2, dim=1)
+                
+                # First (best) prediction
+                confidence = top2_probs[0, 0].item()
+                predicted_idx = top2_indices[0, 0].item()
+                predicted_class = ScrabbleNet.CLASSES[predicted_idx]
+                conf_percent = int(confidence * 100)
+                
+                # Second-best prediction (for debugging low-confidence cases)
+                second_confidence = top2_probs[0, 1].item()
+                second_idx = top2_indices[0, 1].item()
+                second_class = ScrabbleNet.CLASSES[second_idx]
+                second_conf_percent = int(second_confidence * 100)
+                
+                # Handle BLANK class
+                if predicted_class == 'BLANK':
+                    letter = '?'
+                else:
+                    letter = predicted_class
+                
+                # Log second-best option when confidence is below 80%
+                if conf_percent < 80:
+                    second_display = '?' if second_class == 'BLANK' else second_class
+                    print(f"  CNN low conf: {letter}({conf_percent}%) vs {second_display}({second_conf_percent}%)")
+                
+                # Create processed image for caching (convert to grayscale display)
+                if len(tile_face.shape) == 3:
+                    gray = cv2.cvtColor(tile_face, cv2.COLOR_BGR2GRAY)
+                else:
+                    gray = tile_face
+                
+                # Resize for display consistency
+                display_img = cv2.resize(gray, (100, 100))
+                display_img_color = cv2.cvtColor(display_img, cv2.COLOR_GRAY2BGR)
+                
+                return (letter, conf_percent, display_img_color)
+                
+        except Exception as e:
+            print(f"CNN Error: {e}")
+            # Fallback: return unknown
+            if len(tile_face.shape) == 3:
+                display_img = tile_face
+            else:
+                display_img = cv2.cvtColor(tile_face, cv2.COLOR_GRAY2BGR)
+            return ("?", 0, display_img)
+    
+    def _recognize_tile_tesseract(self, tile_face):
+        """Recognize tile using Tesseract OCR. Returns (letter, confidence, processed_image)."""
         # Use the smart cleaning method that removes score number via contour filtering
         clean_img = self.get_smart_tile_letter(tile_face)
 
@@ -351,8 +521,8 @@ class ScrabbleTracker:
         self.OCR_RETRY_INTERVAL_MS = 1000.0  # Retry every 1 second
         self.OCR_MIN_CONFIDENCE = 50  # Retry if confidence below this
         
-        # Async OCR service
-        self.ocr_service = OCRService()
+        # Async OCR service - will be initialized with proper backend choice
+        self.ocr_service = None  # Initialized via set_ocr_backend()
         
         # Dictionary for word validation
         self.dictionary = set()
@@ -384,12 +554,20 @@ class ScrabbleTracker:
         self.override_input_cell = None
         self.override_input_text = ""
         
+        # OCR backend preference (set via set_ocr_backend)
+        self.use_tesseract = False  # Default to CNN
+        
         # Dataset saving state
         self.dataset_dir = None  # Set via set_dataset_dir()
         self.dataset_last_save_time = {}  # (row, col) -> timestamp_ms of last save
         self.DATASET_SAVE_INTERVAL_MS = 5000.0  # Save every 5 seconds per tile
         self.DATASET_MIN_CONFIDENCE = 50  # Only save tiles with >=50% confidence
 
+    def set_ocr_backend(self, use_tesseract=False):
+        """Set the OCR backend (CNN or Tesseract) and initialize the OCR service."""
+        self.use_tesseract = use_tesseract
+        self.ocr_service = OCRService(use_tesseract=use_tesseract)
+    
     def set_dataset_dir(self, dataset_dir):
         """Enable dataset saving to the specified directory."""
         self.dataset_dir = dataset_dir
@@ -2426,6 +2604,7 @@ if __name__ == "__main__":
     parser.add_argument('--players', type=int, default=2, help='Number of players (2-4)')
     parser.add_argument('--our-turn', type=int, default=1, help='Which position our player is at (1-based: 1=first, 2=second, etc.)')
     parser.add_argument('--save-dataset', type=str, default=None, help='Save detected tiles to dataset folder (e.g., dataset_raw)')
+    parser.add_argument('--use-tesseract', action='store_true', help='Use Tesseract OCR instead of CNN model (default: use CNN)')
     
     args = parser.parse_args()
     
@@ -2459,6 +2638,9 @@ if __name__ == "__main__":
     # Enable dataset saving if requested
     if args.save_dataset:
         tracker.set_dataset_dir(args.save_dataset)
+    
+    # Set OCR backend (CNN by default, Tesseract if --use-tesseract flag)
+    tracker.set_ocr_backend(use_tesseract=args.use_tesseract)
     
     if tracker.initialize():
         tracker.process_video()
