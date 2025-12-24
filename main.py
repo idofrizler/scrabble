@@ -294,7 +294,7 @@ class ScrabbleTracker:
         
         # Tile detection parameters
         self.COLOR_CHANGE_THRESHOLD = 25.0  # LAB color difference threshold
-        self.LOCK_IN_TIME_MS = 8000.0  # 8 seconds to lock
+        self.LOCK_IN_TIME_MS = 12000.0  # 12 seconds to lock
         self.UNLOCK_TIME_MS = 5000.0  # 5 seconds to unlock
         
         # Perspective-based tile obstruction offset (pixels to ignore at bottom of each cell)
@@ -369,6 +369,21 @@ class ScrabbleTracker:
         self.manual_input_word_idx = None
         self.manual_input_text = ""
         
+        # Manual letter overrides: (row, col) -> letter
+        # These take precedence over OCR results for display and dataset saving
+        # Use '*' for blank tiles
+        self.manual_overrides = {}
+        
+        # Tile debug view double-click tracking
+        self.last_tile_click_time = 0
+        self.last_tile_click_cell = None
+        self.DOUBLE_CLICK_THRESHOLD_MS = 500.0
+        
+        # Override input state (for tile debug view)
+        self.override_input_active = False
+        self.override_input_cell = None
+        self.override_input_text = ""
+        
         # Dataset saving state
         self.dataset_dir = None  # Set via set_dataset_dir()
         self.dataset_last_save_time = {}  # (row, col) -> timestamp_ms of last save
@@ -396,25 +411,39 @@ class ScrabbleTracker:
     def save_tile_to_dataset(self, row, col, letter, confidence, tile_face, current_time_ms):
         """
         Save a tile image to the dataset folder if conditions are met.
+        Uses manual override letter if present.
         Returns True if saved, False otherwise.
         """
         if self.dataset_dir is None:
             return False
         
-        # Check confidence threshold
-        if confidence < self.DATASET_MIN_CONFIDENCE:
-            return False
+        # Check for manual override - use override letter instead of OCR result
+        override_letter = self.manual_overrides.get((row, col))
+        if override_letter:
+            # Override takes precedence - use it with 100% confidence
+            save_letter = override_letter
+            save_confidence = 100
+        else:
+            # Use OCR result
+            save_letter = letter
+            save_confidence = confidence
+            
+            # Check confidence threshold (only for OCR results)
+            if save_confidence < self.DATASET_MIN_CONFIDENCE:
+                return False
         
         # Check time since last save for this cell
         last_save = self.dataset_last_save_time.get((row, col), 0)
         if current_time_ms - last_save < self.DATASET_SAVE_INTERVAL_MS:
             return False
         
-        # Determine folder (letter or BLANK)
-        if letter == '?' or not letter.isalpha():
+        # Determine folder: '*' -> BLANK, letter -> letter folder, '?' -> BLANK
+        if save_letter == '*':
+            folder = "BLANK"
+        elif save_letter == '?' or not save_letter.isalpha():
             folder = "BLANK"
         else:
-            folder = letter.upper()
+            folder = save_letter.upper()
         
         # Generate unique filename and save
         filename = f"{uuid.uuid4()}.png"
@@ -425,7 +454,8 @@ class ScrabbleTracker:
         # Update last save time
         self.dataset_last_save_time[(row, col)] = current_time_ms
         
-        print(f"  Dataset: Saved {letter} ({confidence}%) -> {folder}/{filename}")
+        override_indicator = " [override]" if override_letter else ""
+        print(f"  Dataset: Saved {save_letter} ({save_confidence}%) -> {folder}/{filename}{override_indicator}")
         return True
 
     def load_dictionary(self):
@@ -563,17 +593,33 @@ class ScrabbleTracker:
                 if cell_data is not None:
                     letter, confidence = cell_data
                     
+                    # Check for manual override - display override letter instead
+                    override_letter = self.manual_overrides.get((row, col))
+                    if override_letter:
+                        # Use override letter, display * as blank indicator
+                        display_letter = override_letter if override_letter != '*' else '_'
+                        display_confidence = 100  # Override is always 100% confidence
+                        has_override = True
+                    else:
+                        display_letter = letter
+                        display_confidence = confidence
+                        has_override = False
+                    
                     # Calculate tile background color based on confidence (0-100)
                     # High confidence (90+): Green-ish
                     # Medium confidence (60-90): Yellow-ish  
                     # Low confidence (<60): Red-ish
-                    if confidence >= 90:
+                    # Use cyan tint for overridden tiles, otherwise confidence-based color
+                    if has_override:
+                        # Cyan tint for override: BGR (255, 255, 180) - light cyan
+                        tile_color = (255, 255, 180)
+                    elif display_confidence >= 90:
                         # Green tint: BGR (180, 255, 200) - light green
                         tile_color = (180, 255, 200)
-                    elif confidence >= 60:
+                    elif display_confidence >= 60:
                         # Yellow/Orange tint: BGR (150, 220, 255) - light orange
                         # Interpolate between green and orange
-                        t = (confidence - 60) / 30.0  # 0 to 1
+                        t = (display_confidence - 60) / 30.0  # 0 to 1
                         tile_color = (
                             int(150 + t * 30),   # B: 150 -> 180
                             int(220 + t * 35),   # G: 220 -> 255
@@ -582,7 +628,7 @@ class ScrabbleTracker:
                     else:
                         # Red tint: BGR (150, 150, 255) - light red
                         # Interpolate between orange and red
-                        t = confidence / 60.0  # 0 to 1
+                        t = display_confidence / 60.0  # 0 to 1
                         tile_color = (
                             int(150),            # B: 150
                             int(150 + t * 70),   # G: 150 -> 220
@@ -593,17 +639,24 @@ class ScrabbleTracker:
                     cv2.rectangle(board_img, (x1+2, y1+2), (x1 + step_x-2, y1 + step_y-2), tile_color, -1)
                     
                     # Center the text
-                    text_size = cv2.getTextSize(letter, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                    text_size = cv2.getTextSize(display_letter, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
                     text_x = x1 + (step_x - text_size[0]) // 2
                     text_y = y1 + (step_y + text_size[1]) // 2
                     
-                    cv2.putText(board_img, letter, (text_x, text_y), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+                    # Use different text color for overrides
+                    text_color = (128, 0, 0) if has_override else (0, 0, 0)  # Dark blue for override
+                    cv2.putText(board_img, display_letter, (text_x, text_y), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2)
                     
-                    # Draw small confidence value in corner
-                    conf_text = f"{confidence}"
+                    # Draw small confidence value or 'OVR' indicator in corner
+                    if has_override:
+                        conf_text = "OVR"
+                        conf_color = (128, 0, 0)  # Dark blue
+                    else:
+                        conf_text = f"{display_confidence}"
+                        conf_color = (80, 80, 80)
                     cv2.putText(board_img, conf_text, (x1 + 3, y1 + step_y - 3), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.25, (80, 80, 80), 1)
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.25, conf_color, 1)
                     
                     # Draw word highlight borders if awaiting confirmation
                     if (row, col) in word_cells_new:
@@ -757,6 +810,8 @@ class ScrabbleTracker:
     def on_board_click(self, event, x, y, flags, params):
         """Handle clicks on the Digital Game State window to show cached tile images or handle buttons."""
         if event == cv2.EVENT_LBUTTONDOWN:
+            current_time_ms = time.time() * 1000.0
+            
             # Check if we're clicking on confirmation buttons
             if self.awaiting_confirmation:
                 # Check Confirm button
@@ -783,63 +838,105 @@ class ScrabbleTracker:
             if 0 <= row < self.grid_size and 0 <= col < self.grid_size:
                 cell_data = self.board_state[row][col]
                 if cell_data is not None and (row, col) in self.tile_image_cache:
-                    letter, confidence = cell_data
-                    tile_img = self.tile_image_cache[(row, col)]
-                    original_img = self.tile_original_cache.get((row, col))
+                    # Check for double-click to start override input
+                    if (self.last_tile_click_cell == (row, col) and 
+                        current_time_ms - self.last_tile_click_time < self.DOUBLE_CLICK_THRESHOLD_MS):
+                        # Double-click detected - start override input mode
+                        self.override_input_active = True
+                        self.override_input_cell = (row, col)
+                        self.override_input_text = ""
+                        print(f"Override mode for ({row},{col}): Type A-Z for letter, * for blank, ESC to cancel, ENTER to confirm")
                     
-                    # Scale up tile images for better visibility
-                    tile_size = (150, 150)
-                    processed_display = cv2.resize(tile_img, tile_size, interpolation=cv2.INTER_NEAREST)
+                    # Update click tracking
+                    self.last_tile_click_cell = (row, col)
+                    self.last_tile_click_time = current_time_ms
                     
-                    # Create combined display with original (if available) and processed
-                    if original_img is not None:
-                        original_display = cv2.resize(original_img, tile_size, interpolation=cv2.INTER_NEAREST)
-                        # Stack horizontally: original | processed
-                        combined_tiles = np.hstack([original_display, processed_display])
-                    else:
-                        # Only processed available
-                        combined_tiles = processed_display
-                    
-                    # Create display with info panel below tiles
-                    info_height = 120
-                    display_width = combined_tiles.shape[1]
-                    tile_display = np.zeros((tile_size[1] + info_height, display_width, 3), dtype=np.uint8)
-                    tile_display[:tile_size[1], :] = combined_tiles
-                    
-                    # Add labels above tiles
-                    if original_img is not None:
-                        cv2.putText(tile_display, "Original", (10, 20), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                        cv2.putText(tile_display, "Processed", (tile_size[0] + 10, 20), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    else:
-                        cv2.putText(tile_display, "Processed", (10, 20), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    
-                    # Add text overlay with detection info (in info panel)
-                    info_y_start = tile_size[1] + 20
-                    cv2.putText(tile_display, f"Cell: ({row},{col})  Letter: {letter}  Conf: {confidence}%", 
-                               (10, info_y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                    
-                    # Show last attempt time
-                    last_attempt = self.last_ocr_attempt_time.get((row, col), 0)
-                    if last_attempt > 0:
-                        current_time_ms = time.time() * 1000.0
-                        seconds_ago = (current_time_ms - last_attempt) / 1000.0
-                        cv2.putText(tile_display, f"Last try: {seconds_ago:.1f}s ago", (10, info_y_start + 30), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                    else:
-                        cv2.putText(tile_display, f"Last try: N/A", (10, info_y_start + 30), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                    
-                    # Show if pending
-                    is_pending = self.ocr_service.is_pending(row, col)
-                    cv2.putText(tile_display, f"Pending: {is_pending}", (10, info_y_start + 60), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255) if is_pending else (0, 255, 0), 1)
-                    
-                    cv2.imshow('Tile Debug View', tile_display)
+                    # Show tile debug view
+                    self.show_tile_debug_view(row, col)
                 else:
                     print(f"No cached image for cell ({row},{col})")
+    
+    def show_tile_debug_view(self, row, col):
+        """Display the tile debug view window for a specific cell."""
+        cell_data = self.board_state[row][col]
+        if cell_data is None or (row, col) not in self.tile_image_cache:
+            return
+        
+        letter, confidence = cell_data
+        tile_img = self.tile_image_cache[(row, col)]
+        original_img = self.tile_original_cache.get((row, col))
+        
+        # Scale up tile images for better visibility
+        tile_size = (150, 150)
+        processed_display = cv2.resize(tile_img, tile_size, interpolation=cv2.INTER_NEAREST)
+        
+        # Create combined display with original (if available) and processed
+        if original_img is not None:
+            original_display = cv2.resize(original_img, tile_size, interpolation=cv2.INTER_NEAREST)
+            # Stack horizontally: original | processed
+            combined_tiles = np.hstack([original_display, processed_display])
+        else:
+            # Only processed available
+            combined_tiles = processed_display
+        
+        # Create display with info panel below tiles
+        info_height = 140  # Increased for override info
+        display_width = combined_tiles.shape[1]
+        tile_display = np.zeros((tile_size[1] + info_height, display_width, 3), dtype=np.uint8)
+        tile_display[:tile_size[1], :] = combined_tiles
+        
+        # Add labels above tiles
+        if original_img is not None:
+            cv2.putText(tile_display, "Original", (10, 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(tile_display, "Processed", (tile_size[0] + 10, 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        else:
+            cv2.putText(tile_display, "Processed", (10, 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Add text overlay with detection info (in info panel)
+        info_y_start = tile_size[1] + 20
+        
+        # Show override status
+        override_letter = self.manual_overrides.get((row, col))
+        if override_letter:
+            display_letter = override_letter if override_letter != '*' else 'BLANK'
+            cv2.putText(tile_display, f"Cell: ({row},{col})  OCR: {letter}  Override: {display_letter}", 
+                       (10, info_y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+        else:
+            cv2.putText(tile_display, f"Cell: ({row},{col})  Letter: {letter}  Conf: {confidence}%", 
+                       (10, info_y_start), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        # Show last attempt time
+        last_attempt = self.last_ocr_attempt_time.get((row, col), 0)
+        if last_attempt > 0:
+            current_time_ms = time.time() * 1000.0
+            seconds_ago = (current_time_ms - last_attempt) / 1000.0
+            cv2.putText(tile_display, f"Last try: {seconds_ago:.1f}s ago", (10, info_y_start + 25), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+        else:
+            cv2.putText(tile_display, f"Last try: N/A", (10, info_y_start + 25), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+        
+        # Show if pending
+        is_pending = self.ocr_service.is_pending(row, col)
+        cv2.putText(tile_display, f"Pending: {is_pending}", (10, info_y_start + 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255) if is_pending else (0, 255, 0), 1)
+        
+        # Show override input state if active
+        if self.override_input_active and self.override_input_cell == (row, col):
+            cv2.rectangle(tile_display, (5, info_y_start + 60), (display_width - 5, info_y_start + 95), (0, 100, 100), -1)
+            input_text = f"Override: {self.override_input_text}_" if self.override_input_text else "Override: _"
+            cv2.putText(tile_display, input_text, (10, info_y_start + 80), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            cv2.putText(tile_display, "A-Z=letter, *=blank, ENTER=ok, ESC=cancel", (10, info_y_start + 110), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+        else:
+            cv2.putText(tile_display, "Double-click to override letter", (10, info_y_start + 80), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+        
+        cv2.imshow('Tile Debug View', tile_display)
     
     def confirm_turn(self):
         """Confirm the current turn and update the confirmed board state."""
@@ -937,8 +1034,75 @@ class ScrabbleTracker:
         
         print(f"Ready for turn {self.turn_number}")
     
+    def handle_override_input(self, key):
+        """Handle keyboard input for tile override in debug view."""
+        if not self.override_input_active:
+            return False  # Not handled
+        
+        row, col = self.override_input_cell
+        
+        if key == 27:  # ESC - cancel override input
+            self.override_input_active = False
+            self.override_input_cell = None
+            self.override_input_text = ""
+            print(f"Override cancelled for ({row},{col})")
+            # Refresh debug view
+            self.show_tile_debug_view(row, col)
+            return True
+        
+        elif key == 13 or key == 10:  # ENTER - confirm override
+            if self.override_input_text:
+                override_char = self.override_input_text.upper()
+                if override_char == '*' or (len(override_char) == 1 and override_char.isalpha()):
+                    # Apply override
+                    self.manual_overrides[(row, col)] = override_char
+                    display_char = 'BLANK' if override_char == '*' else override_char
+                    print(f"Override applied: ({row},{col}) -> {display_char}")
+                    
+                    # Reset dataset timer for this cell so it saves with new label
+                    self.dataset_last_save_time.pop((row, col), None)
+                else:
+                    print(f"Invalid override: must be A-Z or * for blank")
+            else:
+                # Empty input - remove override if exists
+                if (row, col) in self.manual_overrides:
+                    del self.manual_overrides[(row, col)]
+                    print(f"Override removed for ({row},{col})")
+            
+            self.override_input_active = False
+            self.override_input_cell = None
+            self.override_input_text = ""
+            # Refresh debug view
+            self.show_tile_debug_view(row, col)
+            return True
+        
+        elif key == 8:  # BACKSPACE
+            self.override_input_text = self.override_input_text[:-1]
+            self.show_tile_debug_view(row, col)
+            return True
+        
+        elif key == ord('*'):  # Asterisk for blank tile
+            self.override_input_text = "*"
+            self.show_tile_debug_view(row, col)
+            return True
+        
+        elif 32 <= key <= 126:  # Printable ASCII
+            char = chr(key).upper()
+            if char.isalpha():
+                # Only allow single character
+                self.override_input_text = char
+                self.show_tile_debug_view(row, col)
+                return True
+        
+        return True  # Consumed the key even if not recognized
+    
     def handle_key_input(self, key):
         """Handle keyboard input for manual word correction."""
+        # First check if override input is active (takes priority)
+        if self.override_input_active:
+            self.handle_override_input(key)
+            return
+        
         if not self.awaiting_confirmation:
             return
         
@@ -1073,10 +1237,17 @@ class ScrabbleTracker:
         return total_score, word_scores
     
     def get_word_string(self, word_cells):
-        """Convert a list of (row, col) cells to a word string."""
+        """Convert a list of (row, col) cells to a word string.
+        Uses manual overrides if present, otherwise uses OCR result.
+        '*' (blank tile) is displayed as '?' in word strings."""
         letters = []
         for r, c in word_cells:
-            if self.board_state[r][c] is not None:
+            # Check for manual override first
+            override = self.manual_overrides.get((r, c))
+            if override:
+                # Blank tiles (*) display as ? in words
+                letters.append('?' if override == '*' else override)
+            elif self.board_state[r][c] is not None:
                 letters.append(self.board_state[r][c][0])
             else:
                 letters.append('?')
@@ -1978,9 +2149,11 @@ class ScrabbleTracker:
                                         self.ocr_service.submit(tile_face, r, c)
                                 
                                 # Dataset: Periodic re-capture every 5 seconds
+                                # Also save if there's an override (regardless of OCR confidence)
                                 if self.dataset_dir is not None and existing is not None:
                                     letter, confidence = existing
-                                    if confidence >= self.DATASET_MIN_CONFIDENCE:
+                                    has_override = (r, c) in self.manual_overrides
+                                    if has_override or confidence >= self.DATASET_MIN_CONFIDENCE:
                                         last_save = self.dataset_last_save_time.get((r, c), 0)
                                         if current_time_ms - last_save >= self.DATASET_SAVE_INTERVAL_MS:
                                             # Re-extract fresh tile and save
@@ -2058,13 +2231,20 @@ class ScrabbleTracker:
 
             # Handle keyboard input
             key = cv2.waitKey(1) & 0xFF
-            if key == 27:  # ESC to quit (unless in manual input mode)
-                if self.manual_input_active:
+            if key == 27:  # ESC to quit (unless in input mode)
+                if self.override_input_active:
+                    # Cancel override input, don't exit
+                    self.handle_override_input(27)
+                elif self.manual_input_active:
                     self.handle_key_input(27)
                 else:
                     break
             elif key != 255:  # Any other key
-                self.handle_key_input(key)
+                # Check override input first (takes priority)
+                if self.override_input_active:
+                    self.handle_override_input(key)
+                else:
+                    self.handle_key_input(key)
 
         self.cap.release()
         cv2.destroyAllWindows()
@@ -2073,7 +2253,8 @@ class ScrabbleTracker:
         self.print_board_state()
     
     def print_board_state(self):
-        """Print the current board state as a 2D grid to console."""
+        """Print the current board state as a 2D grid to console.
+        Shows override letters where present, with visual indicators."""
         # Count tiles
         tile_count = sum(1 for r in range(self.grid_size) for c in range(self.grid_size) 
                         if self.board_state[r][c] is not None)
@@ -2082,7 +2263,9 @@ class ScrabbleTracker:
             print("\nNo tiles detected on board.")
             return
         
-        print(f"\n=== Final Board State ({tile_count} tiles) ===")
+        override_count = len(self.manual_overrides)
+        override_info = f", {override_count} overrides" if override_count > 0 else ""
+        print(f"\n=== Final Board State ({tile_count} tiles{override_info}) ===")
         print("     " + " ".join(f"{i:2}" for i in range(self.grid_size)))
         print("    +" + "-" * 46 + "+")
         
@@ -2090,22 +2273,33 @@ class ScrabbleTracker:
             row_letters = []
             for col in range(self.grid_size):
                 cell = self.board_state[row][col]
+                override = self.manual_overrides.get((row, col))
                 if cell:
-                    row_letters.append(f" {cell[0]}")
+                    if override:
+                        # Show override letter (use _ for blank)
+                        display = override if override != '*' else '_'
+                        row_letters.append(f" {display}")
+                    else:
+                        row_letters.append(f" {cell[0]}")
                 else:
                     row_letters.append(" .")
             print(f"  {row:2} |" + " ".join(row_letters) + " |")
         
         print("    +" + "-" * 46 + "+")
         
-        # Print tile details with confidence
+        # Print tile details with confidence and overrides
         print(f"\nTile details:")
         for row in range(self.grid_size):
             for col in range(self.grid_size):
                 cell = self.board_state[row][col]
                 if cell:
                     letter, conf = cell
-                    print(f"  ({row:2},{col:2}): {letter} (conf={conf})")
+                    override = self.manual_overrides.get((row, col))
+                    if override:
+                        display = 'BLANK' if override == '*' else override
+                        print(f"  ({row:2},{col:2}): {letter} -> {display} [OVERRIDE]")
+                    else:
+                        print(f"  ({row:2},{col:2}): {letter} (conf={conf})")
 
     def update_3d_pose(self):
         """Calculates camera pose based on the 4 tracked board corners"""
