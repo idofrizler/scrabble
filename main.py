@@ -27,7 +27,10 @@ class ScrabbleNet(nn.Module):
     
     IMG_SIZE = 64  # Must match training
     CLASSES = ['A', 'B', 'BLANK', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 
-               'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']
+               'M', 'N', 'NOISE', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']
+    
+    # Confidence threshold: below this, treat as uncertain (return '?')
+    CONFIDENCE_THRESHOLD = 80
     
     def __init__(self, num_classes=27):
         super(ScrabbleNet, self).__init__()
@@ -328,14 +331,16 @@ class OCRService:
                 second_class = ScrabbleNet.CLASSES[second_idx]
                 second_conf_percent = int(second_confidence * 100)
                 
-                # Handle BLANK class
-                if predicted_class == 'BLANK':
-                    letter = '?'
+                # Handle special classes
+                if predicted_class == 'NOISE':
+                    letter = '?'  # NOISE = uncertain/non-tile
+                elif predicted_class == 'BLANK':
+                    letter = '*'  # BLANK = joker tile (wildcard)
                 else:
                     letter = predicted_class
                 
-                # Log second-best option when confidence is below 80%
-                if conf_percent < 80:
+                # Log second-best option when confidence is below threshold
+                if conf_percent < ScrabbleNet.CONFIDENCE_THRESHOLD:
                     second_display = '?' if second_class == 'BLANK' else second_class
                     print(f"  CNN low conf: {letter}({conf_percent}%) vs {second_display}({second_conf_percent}%)")
                 
@@ -519,7 +524,7 @@ class ScrabbleTracker:
         # OCR retry tracking: (row, col) -> last_attempt_time
         self.last_ocr_attempt_time = {}
         self.OCR_RETRY_INTERVAL_MS = 1000.0  # Retry every 1 second
-        self.OCR_MIN_CONFIDENCE = 50  # Retry if confidence below this
+        self.OCR_MIN_CONFIDENCE = 80  # Retry if confidence below this (matches CNN threshold)
         
         # Async OCR service - will be initialized with proper backend choice
         self.ocr_service = None  # Initialized via set_ocr_backend()
@@ -567,6 +572,36 @@ class ScrabbleTracker:
         """Set the OCR backend (CNN or Tesseract) and initialize the OCR service."""
         self.use_tesseract = use_tesseract
         self.ocr_service = OCRService(use_tesseract=use_tesseract)
+    
+    def ensure_dataset_dir_exists(self):
+        """Ensure dataset_raw directory exists for saving override examples."""
+        default_dir = "dataset_raw"
+        os.makedirs(default_dir, exist_ok=True)
+        for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            os.makedirs(os.path.join(default_dir, letter), exist_ok=True)
+        os.makedirs(os.path.join(default_dir, "BLANK"), exist_ok=True)
+        os.makedirs(os.path.join(default_dir, "NOISE"), exist_ok=True)
+        return default_dir
+    
+    def save_override_to_dataset(self, row, col, override_char):
+        """Save an overridden tile to dataset for training improvement."""
+        if (row, col) not in self.tile_original_cache:
+            return False
+        tile_face = self.tile_original_cache[(row, col)]
+        dataset_dir = self.ensure_dataset_dir_exists()
+        if override_char == '*':
+            folder = "BLANK"
+        elif override_char == '!':
+            folder = "NOISE"
+        elif override_char.isalpha():
+            folder = override_char.upper()
+        else:
+            return False
+        filename = f"override_{uuid.uuid4()}.png"
+        filepath = os.path.join(dataset_dir, folder, filename)
+        cv2.imwrite(filepath, tile_face)
+        print(f"  Override saved to dataset: {folder}/{filename}")
+        return True
     
     def set_dataset_dir(self, dataset_dir):
         """Enable dataset saving to the specified directory."""
@@ -1231,16 +1266,32 @@ class ScrabbleTracker:
         elif key == 13 or key == 10:  # ENTER - confirm override
             if self.override_input_text:
                 override_char = self.override_input_text.upper()
-                if override_char == '*' or (len(override_char) == 1 and override_char.isalpha()):
+                if override_char == '*' or override_char == '!' or (len(override_char) == 1 and override_char.isalpha()):
                     # Apply override
                     self.manual_overrides[(row, col)] = override_char
-                    display_char = 'BLANK' if override_char == '*' else override_char
+                    
+                    if override_char == '*':
+                        display_char = 'BLANK'
+                    elif override_char == '!':
+                        display_char = 'NOISE'
+                    else:
+                        display_char = override_char
                     print(f"Override applied: ({row},{col}) -> {display_char}")
+                    
+                    # Save override to dataset for training improvement
+                    self.save_override_to_dataset(row, col, override_char)
+                    
+                    # For NOISE override, set confidence to 0 to trigger retry
+                    if override_char == '!':
+                        cell_data = self.board_state[row][col]
+                        if cell_data:
+                            letter, _ = cell_data
+                            self.board_state[row][col] = (letter, 0)
                     
                     # Reset dataset timer for this cell so it saves with new label
                     self.dataset_last_save_time.pop((row, col), None)
                 else:
-                    print(f"Invalid override: must be A-Z or * for blank")
+                    print(f"Invalid override: must be A-Z, * for blank, or ! for noise")
             else:
                 # Empty input - remove override if exists
                 if (row, col) in self.manual_overrides:
@@ -1261,6 +1312,11 @@ class ScrabbleTracker:
         
         elif key == ord('*'):  # Asterisk for blank tile
             self.override_input_text = "*"
+            self.show_tile_debug_view(row, col)
+            return True
+        
+        elif key == ord('!'):  # Exclamation for noise
+            self.override_input_text = "!"
             self.show_tile_debug_view(row, col)
             return True
         
