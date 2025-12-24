@@ -1281,12 +1281,16 @@ class ScrabbleTracker:
                     # Save override to dataset for training improvement
                     self.save_override_to_dataset(row, col, override_char)
                     
-                    # For NOISE override, set confidence to 0 to trigger retry
+                    # For NOISE override: mark as ? and set low confidence to trigger retry
+                    # The cell stays locked but OCR will keep retrying with new frames
                     if override_char == '!':
-                        cell_data = self.board_state[row][col]
-                        if cell_data:
-                            letter, _ = cell_data
-                            self.board_state[row][col] = (letter, 0)
+                        # Set to ? with 0 confidence - this triggers OCR retry
+                        self.board_state[row][col] = ('?', 0)
+                        # Clear OCR attempt time to allow immediate retry
+                        self.last_ocr_attempt_time.pop((row, col), None)
+                        # Remove the override so new OCR results can replace it
+                        self.manual_overrides.pop((row, col), None)
+                        print(f"  Cell ({row},{col}) marked as ? - will retry OCR with new frames")
                     
                     # Reset dataset timer for this cell so it saves with new label
                     self.dataset_last_save_time.pop((row, col), None)
