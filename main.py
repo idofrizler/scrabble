@@ -7,6 +7,7 @@ import threading
 import queue
 import re
 import os
+import uuid
 import pytesseract
 from rapidfuzz import fuzz, process
 
@@ -367,6 +368,65 @@ class ScrabbleTracker:
         self.manual_input_active = False
         self.manual_input_word_idx = None
         self.manual_input_text = ""
+        
+        # Dataset saving state
+        self.dataset_dir = None  # Set via set_dataset_dir()
+        self.dataset_last_save_time = {}  # (row, col) -> timestamp_ms of last save
+        self.DATASET_SAVE_INTERVAL_MS = 5000.0  # Save every 5 seconds per tile
+        self.DATASET_MIN_CONFIDENCE = 50  # Only save tiles with >=50% confidence
+
+    def set_dataset_dir(self, dataset_dir):
+        """Enable dataset saving to the specified directory."""
+        self.dataset_dir = dataset_dir
+        
+        # Create directory structure
+        os.makedirs(dataset_dir, exist_ok=True)
+        
+        # Create A-Z folders
+        for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            os.makedirs(os.path.join(dataset_dir, letter), exist_ok=True)
+        
+        # Create BLANK folder for unknown tiles
+        os.makedirs(os.path.join(dataset_dir, "BLANK"), exist_ok=True)
+        
+        print(f"Dataset saving enabled -> {dataset_dir}/")
+        print(f"  Save interval: {self.DATASET_SAVE_INTERVAL_MS/1000.0}s per tile")
+        print(f"  Min confidence: {self.DATASET_MIN_CONFIDENCE}%")
+    
+    def save_tile_to_dataset(self, row, col, letter, confidence, tile_face, current_time_ms):
+        """
+        Save a tile image to the dataset folder if conditions are met.
+        Returns True if saved, False otherwise.
+        """
+        if self.dataset_dir is None:
+            return False
+        
+        # Check confidence threshold
+        if confidence < self.DATASET_MIN_CONFIDENCE:
+            return False
+        
+        # Check time since last save for this cell
+        last_save = self.dataset_last_save_time.get((row, col), 0)
+        if current_time_ms - last_save < self.DATASET_SAVE_INTERVAL_MS:
+            return False
+        
+        # Determine folder (letter or BLANK)
+        if letter == '?' or not letter.isalpha():
+            folder = "BLANK"
+        else:
+            folder = letter.upper()
+        
+        # Generate unique filename and save
+        filename = f"{uuid.uuid4()}.png"
+        filepath = os.path.join(self.dataset_dir, folder, filename)
+        
+        cv2.imwrite(filepath, tile_face)
+        
+        # Update last save time
+        self.dataset_last_save_time[(row, col)] = current_time_ms
+        
+        print(f"  Dataset: Saved {letter} ({confidence}%) -> {folder}/{filename}")
+        return True
 
     def load_dictionary(self):
         """Load Scrabble dictionary from words.txt file."""
@@ -1873,12 +1933,22 @@ class ScrabbleTracker:
                                 self.board_state[r][c] = (letter, confidence)
                                 self.tile_image_cache[(r, c)] = tile_clean
                                 print(f"Recognized {letter} (conf={confidence}) at ({r},{c})")
+                                
+                                # Save to dataset if enabled (use original cached tile)
+                                if (r, c) in self.tile_original_cache:
+                                    self.save_tile_to_dataset(r, c, letter, confidence, 
+                                                             self.tile_original_cache[(r, c)], current_time_ms)
                             elif confidence > existing[1]:
                                 # New result is better - update
                                 old_letter, old_conf = existing
                                 self.board_state[r][c] = (letter, confidence)
                                 self.tile_image_cache[(r, c)] = tile_clean
                                 print(f"Updated ({r},{c}): {old_letter}({old_conf}) -> {letter}({confidence})")
+                                
+                                # Save to dataset if enabled (use original cached tile)
+                                if (r, c) in self.tile_original_cache:
+                                    self.save_tile_to_dataset(r, c, letter, confidence, 
+                                                             self.tile_original_cache[(r, c)], current_time_ms)
                     
                     # 2. Process cells - submit new OCR requests or retry low-confidence ones
                     for r in range(self.grid_size):
@@ -1906,6 +1976,17 @@ class ScrabbleTracker:
                                         # Cache the original tile capture (before OCR processing)
                                         self.tile_original_cache[(r, c)] = tile_face.copy()
                                         self.ocr_service.submit(tile_face, r, c)
+                                
+                                # Dataset: Periodic re-capture every 5 seconds
+                                if self.dataset_dir is not None and existing is not None:
+                                    letter, confidence = existing
+                                    if confidence >= self.DATASET_MIN_CONFIDENCE:
+                                        last_save = self.dataset_last_save_time.get((r, c), 0)
+                                        if current_time_ms - last_save >= self.DATASET_SAVE_INTERVAL_MS:
+                                            # Re-extract fresh tile and save
+                                            tile_face = self.extract_tile_face(frame_clean, r, c, output_size=(100, 100), margin_scale=0.1)
+                                            if tile_face is not None:
+                                                self.save_tile_to_dataset(r, c, letter, confidence, tile_face, current_time_ms)
                             else:
                                 # Cell is UNLOCKED - cancel any pending OCR and clear state
                                 self.ocr_service.cancel(r, c)
@@ -2150,6 +2231,7 @@ if __name__ == "__main__":
     parser.add_argument('--turns', action='store_true', help='Enable turn management mode (validates placement, requires confirmation)')
     parser.add_argument('--players', type=int, default=2, help='Number of players (2-4)')
     parser.add_argument('--our-turn', type=int, default=1, help='Which position our player is at (1-based: 1=first, 2=second, etc.)')
+    parser.add_argument('--save-dataset', type=str, default=None, help='Save detected tiles to dataset folder (e.g., dataset_raw)')
     
     args = parser.parse_args()
     
@@ -2179,5 +2261,10 @@ if __name__ == "__main__":
         print(f"Players: {num_players}, Our position: {our_turn} (0-based index: {tracker.our_player_index})")
     else:
         print("Simple OCR mode - tiles are detected and displayed without turn validation")
+    
+    # Enable dataset saving if requested
+    if args.save_dataset:
+        tracker.set_dataset_dir(args.save_dataset)
+    
     if tracker.initialize():
         tracker.process_video()
