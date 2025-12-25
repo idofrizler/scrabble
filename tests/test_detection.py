@@ -12,6 +12,7 @@ This allows tracking improvement over time without blocking CI.
 
 import pytest
 import json
+import os
 from pathlib import Path
 from datetime import datetime
 
@@ -23,6 +24,23 @@ from main import ScrabbleTracker
 
 # Results file to track accuracy over time
 RESULTS_FILE = Path(__file__).parent / "accuracy_results.json"
+
+# Run ID file to persist run ID across test invocations in the same session
+RUN_ID_FILE = Path(__file__).parent / ".current_run_id"
+
+def get_current_run_id():
+    """
+    Get the current run ID. 
+    Run IDs are generated once per test session and shared across all tests.
+    Format: YYYYMMDD-HHMMSS
+    """
+    # Check environment variable first (set by conftest)
+    env_run_id = os.environ.get('SCRABBLE_TEST_RUN_ID')
+    if env_run_id:
+        return env_run_id
+    
+    # Fallback: generate new run ID
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
 
 def board_to_cells(board):
     """Convert 2D board array to set of (row, col) tuples for non-empty cells."""
@@ -132,7 +150,7 @@ def calculate_scores(fixture, result):
         'false_detections_removed_list': sorted(false_detections_removed),
     }
 
-def save_results(results):
+def save_results(results, run_id=None):
     """Save test results to JSON file for tracking over time."""
     # Load existing results
     all_results = {}
@@ -143,8 +161,10 @@ def save_results(results):
         except:
             pass
     
-    # Add timestamp
+    # Add timestamp and run_id
     timestamp = datetime.now().isoformat()
+    if run_id is None:
+        run_id = get_current_run_id()
     
     # Update with new results
     for video_name, scores in results.items():
@@ -152,6 +172,7 @@ def save_results(results):
             all_results[video_name] = []
         all_results[video_name].append({
             'timestamp': timestamp,
+            'run_id': run_id,
             **scores
         })
         # Keep only last 10 results per video
@@ -219,6 +240,9 @@ class TestAccuracy:
         # Print report
         print_score_report(video_name, scores)
         
+        # Get run ID for this test session
+        run_id = get_current_run_id()
+        
         # Save results for tracking
         save_results({video_name: {
             'overall_accuracy': scores['overall_accuracy'],
@@ -233,7 +257,7 @@ class TestAccuracy:
             'tiles_removed': scores['tiles_removed'],
             'transient_false_positives': scores['transient_false_positives'],
             'false_detections_removed': scores['false_detections_removed'],
-        }})
+        }}, run_id=run_id)
         
         # Store scores for summary
         if not hasattr(self.__class__, '_all_scores'):

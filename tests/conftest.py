@@ -3,8 +3,10 @@ Pytest configuration and fixtures for Scrabble Tracker tests.
 """
 
 import json
+import os
 import sys
 from pathlib import Path
+from datetime import datetime
 
 import pytest
 
@@ -16,6 +18,13 @@ from main import ScrabbleTracker
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 VIDEOS_DIR = Path(__file__).parent.parent / "videos"
+
+def pytest_configure(config):
+    """Set up run ID at the start of the test session."""
+    # Generate a unique run ID for this test session
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    os.environ['SCRABBLE_TEST_RUN_ID'] = run_id
+    print(f"\n[Test Run ID: {run_id}]")
 
 
 def get_available_fixtures():

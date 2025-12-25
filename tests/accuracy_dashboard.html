@@ -152,44 +152,61 @@
             <!-- Filled by JS -->
         </div>
         
-        <div class="charts-row">
-            <div class="chart-container">
-                <h2>📈 Overall Accuracy Over Time</h2>
-                <div class="chart-wrapper">
-                    <canvas id="accuracyChart"></canvas>
-                </div>
-            </div>
-            <div class="chart-container">
-                <h2>🚫 False Detections Over Time</h2>
-                <div class="chart-wrapper">
-                    <canvas id="falsePositivesChart"></canvas>
-                </div>
-            </div>
+        <h2 class="section-title">🏃 Latest Run</h2>
+        <div id="runSelector" style="margin-bottom: 15px;">
+            <select id="runIdSelect" style="background: #16213e; color: #eee; border: 1px solid #0f3460; padding: 8px 15px; border-radius: 5px; font-size: 14px;">
+                <option value="">Select a run...</option>
+            </select>
         </div>
-        
-        <h2 class="section-title">📊 Per-Test Results (Latest)</h2>
-        <table id="latestTable">
+        <table id="runTable">
             <thead>
                 <tr>
                     <th>Test</th>
                     <th>Overall</th>
                     <th>Cell F1</th>
                     <th>OCR</th>
+                    <th>Precision</th>
+                    <th>Recall</th>
+                    <th>Transient FP</th>
                     <th>Tiles</th>
-                    <th>False Detections</th>
-                    <th>Removed</th>
-                    <th>Timestamp</th>
                 </tr>
             </thead>
             <tbody></tbody>
+            <tfoot>
+                <tr style="background: #0f3460; font-weight: bold;">
+                    <td>AVERAGE</td>
+                    <td id="runAvgOverall">-</td>
+                    <td id="runAvgF1">-</td>
+                    <td id="runAvgOCR">-</td>
+                    <td id="runAvgPrecision">-</td>
+                    <td id="runAvgRecall">-</td>
+                    <td id="runTotalFP">-</td>
+                    <td id="runTotalTiles">-</td>
+                </tr>
+            </tfoot>
         </table>
+        
+        <div class="charts-row" style="margin-top: 30px;">
+            <div class="chart-container">
+                <h2>📈 Overall Accuracy by Run</h2>
+                <div class="chart-wrapper">
+                    <canvas id="accuracyChart"></canvas>
+                </div>
+            </div>
+            <div class="chart-container">
+                <h2>🚫 False Detections by Run</h2>
+                <div class="chart-wrapper">
+                    <canvas id="falsePositivesChart"></canvas>
+                </div>
+            </div>
+        </div>
         
         <h2 class="section-title">📜 Full History</h2>
         <table id="historyTable">
             <thead>
                 <tr>
                     <th>Test</th>
-                    <th>Run #</th>
+                    <th>Run ID</th>
                     <th>Overall</th>
                     <th>Cell F1</th>
                     <th>OCR</th>
@@ -399,26 +416,33 @@
                 </div>
             `;
             
-            // Latest table
-            const latestTbody = document.querySelector('#latestTable tbody');
-            latestTbody.innerHTML = '';
+            // Collect all run IDs
+            const allRunIds = new Set();
             testNames.forEach(test => {
-                const results = data[test];
-                if (results.length === 0) return;
-                const r = results[results.length - 1];
-                const row = document.createElement('tr');
-                row.innerHTML = `
-                    <td><strong>${test}</strong></td>
-                    <td class="accuracy-cell ${getAccuracyClass(r.overall_accuracy)}">${r.overall_accuracy.toFixed(1)}%</td>
-                    <td>${r.cell_f1.toFixed(1)}%</td>
-                    <td>${r.ocr_accuracy.toFixed(1)}%</td>
-                    <td>${r.expected_tiles}</td>
-                    <td class="${(r.transient_false_positives || 0) > 0 ? 'low' : 'high'}">${r.transient_false_positives || 0}</td>
-                    <td>${r.tiles_removed || 0}</td>
-                    <td class="timestamp">${formatDate(r.timestamp)}</td>
-                `;
-                latestTbody.appendChild(row);
+                data[test].forEach(r => {
+                    if (r.run_id) allRunIds.add(r.run_id);
+                });
             });
+            
+            // Populate run selector
+            const runSelect = document.getElementById('runIdSelect');
+            runSelect.innerHTML = '<option value="">Select a run...</option>';
+            Array.from(allRunIds).sort().reverse().forEach(runId => {
+                const opt = document.createElement('option');
+                opt.value = runId;
+                opt.textContent = formatRunId(runId);
+                runSelect.appendChild(opt);
+            });
+            
+            // Set up run selector change handler
+            runSelect.onchange = () => renderRunTable(data, runSelect.value);
+            
+            // Auto-select most recent run if available
+            if (allRunIds.size > 0) {
+                const mostRecent = Array.from(allRunIds).sort().reverse()[0];
+                runSelect.value = mostRecent;
+                renderRunTable(data, mostRecent);
+            }
             
             // History table
             const historyTbody = document.querySelector('#historyTable tbody');
@@ -428,7 +452,7 @@
                     const row = document.createElement('tr');
                     row.innerHTML = `
                         <td>${test}</td>
-                        <td>#${i + 1}</td>
+                        <td class="timestamp">${r.run_id || '—'}</td>
                         <td class="accuracy-cell ${getAccuracyClass(r.overall_accuracy)}">${r.overall_accuracy.toFixed(1)}%</td>
                         <td>${r.cell_f1.toFixed(1)}%</td>
                         <td>${r.ocr_accuracy.toFixed(1)}%</td>
@@ -441,26 +465,104 @@
                 });
             });
             
-            // Charts
-            renderCharts(data, testNames);
+            // Charts - only show runs with run_id
+            renderCharts(data, testNames, Array.from(allRunIds).sort());
         }
         
-        function renderCharts(data, testNames) {
+        function formatRunId(runId) {
+            // Convert 20251225-143000 to "Dec 25, 2025 2:30 PM"
+            if (!runId || runId.length !== 15) return runId;
+            const year = runId.slice(0, 4);
+            const month = parseInt(runId.slice(4, 6)) - 1;
+            const day = runId.slice(6, 8);
+            const hour = runId.slice(9, 11);
+            const min = runId.slice(11, 13);
+            const sec = runId.slice(13, 15);
+            const d = new Date(year, month, day, hour, min, sec);
+            return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+        }
+        
+        function renderRunTable(data, runId) {
+            const table = document.getElementById('runTable');
+            const tbody = table.querySelector('tbody');
+            
+            if (!runId) {
+                table.style.display = 'none';
+                return;
+            }
+            
+            table.style.display = 'table';
+            tbody.innerHTML = '';
+            
+            const testNames = Object.keys(data).sort();
+            let totalOverall = 0, totalF1 = 0, totalOCR = 0, totalPrecision = 0, totalRecall = 0;
+            let totalFP = 0, totalTiles = 0;
+            let count = 0;
+            
+            testNames.forEach(test => {
+                // Find result with matching run_id
+                const result = data[test].find(r => r.run_id === runId);
+                if (!result) return;
+                
+                const row = document.createElement('tr');
+                row.innerHTML = `
+                    <td><strong>${test}</strong></td>
+                    <td class="accuracy-cell ${getAccuracyClass(result.overall_accuracy)}">${result.overall_accuracy.toFixed(1)}%</td>
+                    <td>${result.cell_f1.toFixed(1)}%</td>
+                    <td>${result.ocr_accuracy.toFixed(1)}%</td>
+                    <td>${result.cell_precision.toFixed(1)}%</td>
+                    <td>${result.cell_recall.toFixed(1)}%</td>
+                    <td class="${(result.transient_false_positives || 0) > 0 ? 'low' : 'high'}">${result.transient_false_positives || 0}</td>
+                    <td>${result.expected_tiles}</td>
+                `;
+                tbody.appendChild(row);
+                
+                totalOverall += result.overall_accuracy;
+                totalF1 += result.cell_f1;
+                totalOCR += result.ocr_accuracy;
+                totalPrecision += result.cell_precision;
+                totalRecall += result.cell_recall;
+                totalFP += result.transient_false_positives || 0;
+                totalTiles += result.expected_tiles;
+                count++;
+            });
+            
+            // Update footer averages
+            if (count > 0) {
+                document.getElementById('runAvgOverall').textContent = (totalOverall / count).toFixed(1) + '%';
+                document.getElementById('runAvgOverall').className = 'accuracy-cell ' + getAccuracyClass(totalOverall / count);
+                document.getElementById('runAvgF1').textContent = (totalF1 / count).toFixed(1) + '%';
+                document.getElementById('runAvgOCR').textContent = (totalOCR / count).toFixed(1) + '%';
+                document.getElementById('runAvgPrecision').textContent = (totalPrecision / count).toFixed(1) + '%';
+                document.getElementById('runAvgRecall').textContent = (totalRecall / count).toFixed(1) + '%';
+                document.getElementById('runTotalFP').textContent = totalFP;
+                document.getElementById('runTotalFP').className = totalFP > 0 ? 'low' : 'high';
+                document.getElementById('runTotalTiles').textContent = totalTiles;
+            }
+        }
+        
+        function renderCharts(data, testNames, runIds) {
             const colors = ['#00d4ff', '#4ade80', '#fbbf24', '#f87171', '#a78bfa', '#fb923c'];
             
-            // Find max runs across all tests
-            const maxRuns = Math.max(...testNames.map(t => data[t].length));
-            const labels = Array.from({length: maxRuns}, (_, i) => `Run ${i + 1}`);
+            // Use run IDs as labels (formatted)
+            const labels = runIds.map(id => formatRunId(id).split(' ')[0]); // Just date part
             
-            // Accuracy chart
-            const accDatasets = testNames.map((test, i) => ({
-                label: test,
-                data: data[test].map(r => r.overall_accuracy),
-                borderColor: colors[i % colors.length],
-                backgroundColor: colors[i % colors.length] + '33',
-                tension: 0.3,
-                fill: false
-            }));
+            // For each test, find data points matching each run ID
+            const accDatasets = testNames.map((test, i) => {
+                const dataPoints = runIds.map(runId => {
+                    const result = data[test].find(r => r.run_id === runId);
+                    return result ? result.overall_accuracy : null;
+                });
+                return {
+                    label: test,
+                    data: dataPoints,
+                    borderColor: colors[i % colors.length],
+                    backgroundColor: colors[i % colors.length] + '33',
+                    tension: 0.3,
+                    fill: false,
+                    spanGaps: true
+                };
+            });
             
             if (accuracyChart) accuracyChart.destroy();
             accuracyChart = new Chart(document.getElementById('accuracyChart'), {
@@ -478,14 +580,21 @@
             });
             
             // False positives chart
-            const fpDatasets = testNames.map((test, i) => ({
-                label: test,
-                data: data[test].map(r => r.transient_false_positives || 0),
-                borderColor: colors[i % colors.length],
-                backgroundColor: colors[i % colors.length] + '33',
-                tension: 0.3,
-                fill: false
-            }));
+            const fpDatasets = testNames.map((test, i) => {
+                const dataPoints = runIds.map(runId => {
+                    const result = data[test].find(r => r.run_id === runId);
+                    return result ? (result.transient_false_positives || 0) : null;
+                });
+                return {
+                    label: test,
+                    data: dataPoints,
+                    borderColor: colors[i % colors.length],
+                    backgroundColor: colors[i % colors.length] + '33',
+                    tension: 0.3,
+                    fill: false,
+                    spanGaps: true
+                };
+            });
             
             if (fpChart) fpChart.destroy();
             fpChart = new Chart(document.getElementById('falsePositivesChart'), {
