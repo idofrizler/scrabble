@@ -98,6 +98,17 @@ def calculate_scores(fixture, result):
     overall_correct = ocr_correct
     overall_accuracy = overall_correct / len(expected_cells) * 100 if expected_cells else 100
     
+    # False positive tracking metrics
+    tiles_ever_locked = result.get('tiles_ever_locked', set())
+    tiles_removed = result.get('tiles_removed', set())
+    
+    # False positives that were removed: locked transiently then unlocked, and NOT expected tiles
+    # These are cells that were wrongly detected as tiles and later correctly cleared
+    false_detections_removed = tiles_removed - expected_cells
+    
+    # All transient false positives: cells ever locked that shouldn't have been
+    transient_false_positives = tiles_ever_locked - expected_cells
+    
     return {
         'cell_precision': round(precision, 1),
         'cell_recall': round(recall, 1),
@@ -113,6 +124,12 @@ def calculate_scores(fixture, result):
         'ocr_errors': ocr_errors,
         'false_positives': sorted(false_positives),
         'false_negatives': sorted(false_negatives),
+        # New false detection tracking metrics
+        'tiles_ever_locked': len(tiles_ever_locked),
+        'tiles_removed': len(tiles_removed),
+        'transient_false_positives': len(transient_false_positives),
+        'false_detections_removed': len(false_detections_removed),
+        'false_detections_removed_list': sorted(false_detections_removed),
     }
 
 def save_results(results):
@@ -156,10 +173,20 @@ def print_score_report(video_name, scores):
     print(f"  │    F1 Score:  {scores['cell_f1']:.1f}%")
     print(f"  └─ OCR Accuracy: {scores['ocr_accuracy']:.1f}% ({scores['ocr_correct']}/{scores['correct_cells']} letters correct)")
     
+    # False detection tracking (transient false positives)
+    print(f"\n  False Detection Tracking:")
+    print(f"    Tiles ever locked:       {scores['tiles_ever_locked']}")
+    print(f"    Tiles removed (unlocked): {scores['tiles_removed']}")
+    print(f"    Transient false positives: {scores['transient_false_positives']} (locked but shouldn't be)")
+    print(f"    False detections removed:  {scores['false_detections_removed']} (wrongly locked, then correctly cleared)")
+    
+    if scores['false_detections_removed_list']:
+        print(f"    └─ Cells: {scores['false_detections_removed_list']}")
+    
     if scores['missing_cells']:
         print(f"\n  Missing cells: {scores['missing_cells']}")
     if scores['false_positives']:
-        print(f"  Extra cells:   {scores['false_positives']}")
+        print(f"  Extra cells (still locked at end): {scores['false_positives']}")
     if scores['ocr_errors']:
         print(f"  OCR errors:")
         for (row, col), expected, detected in scores['ocr_errors']:
@@ -201,6 +228,11 @@ class TestAccuracy:
             'ocr_accuracy': scores['ocr_accuracy'],
             'expected_tiles': scores['expected_tiles'],
             'ocr_correct': scores['ocr_correct'],
+            # New false detection tracking metrics
+            'tiles_ever_locked': scores['tiles_ever_locked'],
+            'tiles_removed': scores['tiles_removed'],
+            'transient_false_positives': scores['transient_false_positives'],
+            'false_detections_removed': scores['false_detections_removed'],
         }})
         
         # Store scores for summary

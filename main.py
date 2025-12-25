@@ -32,7 +32,7 @@ class ScrabbleNet(nn.Module):
     # Confidence threshold: below this, treat as uncertain (return '?')
     CONFIDENCE_THRESHOLD = 80
     
-    def __init__(self, num_classes=27):
+    def __init__(self, num_classes=28):
         super(ScrabbleNet, self).__init__()
         self.features = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
@@ -466,6 +466,10 @@ class ScrabbleTracker:
         self.cell_no_change_duration_ms = np.zeros((self.grid_size, self.grid_size), dtype=np.float32)  # ms of no change (for unlocking)
         self.locked_cells = np.zeros((self.grid_size, self.grid_size), dtype=bool)  # locked tile flags
         self.last_frame_time = None  # for delta time calculation
+        
+        # False positive tracking - cells that were ever locked during processing
+        self.tiles_ever_locked = set()  # (row, col) tuples of all cells ever locked
+        self.tiles_removed = set()  # (row, col) tuples of cells that were locked then unlocked
         
         # Tile detection parameters
         self.COLOR_CHANGE_THRESHOLD = 25.0  # LAB color difference threshold
@@ -1731,6 +1735,8 @@ class ScrabbleTracker:
                             self.locked_cells[row, col] = False
                             self.cell_no_change_duration_ms[row, col] = 0
                             self.cell_change_duration_ms[row, col] = 0
+                            # Track for false positive analysis
+                            self.tiles_removed.add((row, col))
                 else:
                     # Cell is not locked - check for lock condition
                     if is_changed:
@@ -1741,6 +1747,8 @@ class ScrabbleTracker:
                             # Lock the cell
                             self.locked_cells[row, col] = True
                             self.cell_change_duration_ms[row, col] = 0
+                            # Track for false positive analysis
+                            self.tiles_ever_locked.add((row, col))
                     else:
                         # No change detected, reset change counter
                         self.cell_change_duration_ms[row, col] = 0
@@ -2180,7 +2188,9 @@ class ScrabbleTracker:
             'locked_cells': locked_cells_set,
             'board_state': self.board_state,
             'corners': corners_list,
-            'total_frames': frame_num
+            'total_frames': frame_num,
+            'tiles_ever_locked': self.tiles_ever_locked.copy(),
+            'tiles_removed': self.tiles_removed.copy()
         }
 
     def process_video(self):

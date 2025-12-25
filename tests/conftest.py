@@ -100,6 +100,9 @@ def tracker_factory():
             manual_corners = parse_corners(corners)
         
         tracker = ScrabbleTracker(video_path, manual_corners)
+        # Initialize OCR service (required for process_headless)
+        tracker.set_ocr_backend(use_tesseract=False)
+        
         if not tracker.initialize():
             raise RuntimeError(f"Failed to initialize tracker for {video_path}")
         
