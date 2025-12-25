@@ -63,7 +63,7 @@ class OCRService:
     
     NUM_WORKERS = 2  # Number of parallel OCR workers
     
-    def __init__(self, use_tesseract=False, model_path="scrabble_net.pth"):
+    def __init__(self, use_tesseract=False, model_path="training/scrabble_net.pth"):
         self.queue = queue.Queue()
         self.pending = {}  # (row, col) -> request_id
         self.pending_lock = threading.Lock()  # Protect pending dict access
