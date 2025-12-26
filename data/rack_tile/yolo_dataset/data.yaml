@@ -1,0 +1,6 @@
+names:
+  0: rack
+  1: tile
+path: /Users/idofrizler/Git/scrabble/data/rack_tile/yolo_dataset
+train: images/train
+val: images/val

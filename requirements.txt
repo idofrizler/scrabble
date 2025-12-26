@@ -5,3 +5,4 @@ rapidfuzz
 pytest
 torch
 torchvision
+ultralytics
