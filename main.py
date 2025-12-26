@@ -2444,6 +2444,19 @@ class ScrabbleTracker:
         
         # Check if we're in interactive mode (live camera)
         is_interactive = hasattr(self, 'interactive_mode') and self.interactive_mode
+        
+        # Initialize video writer for recording (interactive mode only)
+        video_writer = None
+        if is_interactive and hasattr(self, 'record_path') and self.record_path:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            fps = 30.0  # Standard webcam fps
+            video_writer = cv2.VideoWriter(self.record_path, fourcc, fps, 
+                                          (self.frame_width, self.frame_height))
+            if video_writer.isOpened():
+                print(f"Recording to: {self.record_path}")
+            else:
+                print(f"Warning: Could not open video writer for {self.record_path}")
+                video_writer = None
 
         while True:
             if is_interactive:
@@ -2467,6 +2480,10 @@ class ScrabbleTracker:
                     frame = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
                 
                 last_frame = frame.copy()
+                
+                # Write frame to video if recording
+                if video_writer is not None:
+                    video_writer.write(frame)
             elif not paused:
                 # Video mode: read frames based on playback speed
                 for _ in range(playback_speed):
@@ -2897,6 +2914,11 @@ class ScrabbleTracker:
         if self.rack_detector is not None:
             self.rack_detector.stop()
         
+        # Release video writer if recording
+        if video_writer is not None:
+            video_writer.release()
+            print(f"Recording saved to: {self.record_path}")
+        
         self.cap.release()
         cv2.destroyAllWindows()
         
@@ -3088,6 +3110,7 @@ if __name__ == "__main__":
     parser.add_argument('--use-tesseract', action='store_true', help='Use Tesseract OCR instead of CNN model (default: use CNN)')
     parser.add_argument('--detect-rack', action='store_true', help='Enable rack and tile detection using YOLOv8')
     parser.add_argument('--rack-model', type=str, default='training/rack_tile_yolov8.pt', help='Path to rack detection YOLOv8 model')
+    parser.add_argument('--record', type=str, default=None, help='Record interactive session to MP4 file (e.g., --record session.mp4)')
     
     args = parser.parse_args()
     
@@ -3101,9 +3124,15 @@ if __name__ == "__main__":
         print("Press SPACE to pause/resume processing")
         print("Press ESC to exit")
         print("=" * 45 + "\n")
+        
+        # Check for recording option
+        if args.record:
+            print(f"Recording enabled: {args.record}")
     else:
         video_source = args.video_path
         interactive_mode = False
+        if args.record:
+            print("Warning: --record only works in interactive mode, ignoring.")
     
     manual_corners = None
     if args.corners:
@@ -3117,6 +3146,7 @@ if __name__ == "__main__":
     tracker = ScrabbleTracker(video_source, manual_corners)
     tracker.show_orb = args.show_orb
     tracker.interactive_mode = interactive_mode
+    tracker.record_path = args.record if interactive_mode else None
     
     # In interactive mode, turns are always enabled
     tracker.turns_mode = args.turns or interactive_mode
