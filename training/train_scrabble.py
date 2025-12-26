@@ -6,8 +6,8 @@ from torch.utils.data import DataLoader
 import os
 
 # 1. Configuration
-DATA_DIR = 'dataset_raw'  # Folder with your A, B, C... subfolders
-MODEL_SAVE_PATH = 'scrabble_net.pth'
+DATA_DIR = 'data/tile_ocr'  # Folder with your A, B, C... subfolders
+MODEL_SAVE_PATH = 'training/scrabble_net.pth'
 IMG_SIZE = 64         # Resize all tiles to 64x64
 BATCH_SIZE = 32
 
