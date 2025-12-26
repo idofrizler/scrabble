@@ -3179,6 +3179,16 @@ if __name__ == "__main__":
         # Initialize word solver (always in interactive mode, or if turns enabled)
         if tracker.turns_mode:
             tracker.initialize_word_solver()
+            
+            # Set up callback for rack changes to recalculate word suggestions
+            if tracker.rack_detector and tracker.word_solver:
+                def on_rack_change():
+                    # Unlock suggestion and trigger recalculation
+                    tracker.suggestion_locked = False
+                    tracker.suggested_move = None
+                    print("Rack changed - word suggestion will recalculate")
+                
+                tracker.rack_detector.set_on_rack_change(on_rack_change)
     
     if tracker.initialize():
         tracker.process_video()

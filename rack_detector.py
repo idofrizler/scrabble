@@ -45,6 +45,10 @@ class RackDetector:
     RACK_CONFIDENCE = 0.5
     TILE_CONFIDENCE = 0.3
     
+    # Tile locking thresholds (similar to board tiles)
+    LOCK_CONFIDENCE_THRESHOLD = 80  # Lock tile at this confidence
+    OCR_RETRY_INTERVAL_MS = 1000.0  # Retry OCR every 1 second for low-confidence tiles
+    
     # Virtual rack display settings
     VIRTUAL_RACK_WIDTH = 500
     VIRTUAL_RACK_HEIGHT = 80
@@ -72,6 +76,14 @@ class RackDetector:
         self.last_rack_box = None  # (x1, y1, x2, y2) of detected rack
         self.last_tile_boxes = []  # List of (x1, y1, x2, y2) for each tile
         
+        # Tile locking state (persists within a turn)
+        # Indexed by position (0-6), stores: (letter, confidence, tile_image, locked, last_retry_time)
+        self.locked_tiles = {}  # position -> (letter, conf, tile_img, is_locked, last_retry_time)
+        self.manual_overrides = {}  # position -> letter (user overrides)
+        
+        # Callback for when rack changes (for word solver recalculation)
+        self.on_rack_change_callback = None
+        
         # Thread for detection
         self.detection_thread = None
         
@@ -90,6 +102,9 @@ class RackDetector:
         
         # Dataset directory for saving overrides
         self.dataset_dir = "data/tile_ocr"
+        
+        # Turn tracking (to know when to reset locks)
+        self.current_turn_number = -1
         
         # Load YOLO model
         if YOLO_AVAILABLE:
@@ -228,19 +243,65 @@ class RackDetector:
                     
                     tile_boxes = tiles_in_rack
                 
-                # Run OCR on each tile
+                # Run OCR on each tile with locking logic
                 letters = []
+                current_time = time.time() * 1000.0
+                rack_changed = False
+                
                 for i, tile_img in enumerate(tile_images):
+                    # Check if we have a manual override for this position
+                    if i in self.manual_overrides:
+                        override_letter = self.manual_overrides[i]
+                        letters.append((override_letter, 100, tile_img))
+                        continue
+                    
+                    # Check if this tile is already locked
+                    if i in self.locked_tiles:
+                        locked_letter, locked_conf, _, is_locked, last_retry = self.locked_tiles[i]
+                        
+                        if is_locked and locked_conf >= self.LOCK_CONFIDENCE_THRESHOLD:
+                            # Tile is locked - use locked value
+                            letters.append((locked_letter, locked_conf, tile_img))
+                            continue
+                        else:
+                            # Low confidence locked tile - check if we should retry OCR
+                            if current_time - last_retry < self.OCR_RETRY_INTERVAL_MS:
+                                # Not time to retry yet - use existing value
+                                letters.append((locked_letter, locked_conf, tile_img))
+                                continue
+                    
+                    # Run OCR on this tile
                     if self.ocr_service is not None:
                         letter, conf, _ = self.ocr_service._recognize_tile(tile_img)
-                        letters.append((letter, conf, tile_img))
                     else:
-                        letters.append(('?', 0, tile_img))
+                        letter, conf = '?', 0
+                    
+                    # Update or create locked tile entry
+                    old_letter = self.locked_tiles.get(i, ('?', 0, None, False, 0))[0]
+                    should_lock = conf >= self.LOCK_CONFIDENCE_THRESHOLD
+                    self.locked_tiles[i] = (letter, conf, tile_img, should_lock, current_time)
+                    
+                    # Check if rack changed (for callback)
+                    if letter != old_letter and letter not in ('?', '*'):
+                        rack_changed = True
+                    
+                    letters.append((letter, conf, tile_img))
+                
+                # Clean up locked tiles for positions that no longer exist
+                positions_to_remove = [pos for pos in self.locked_tiles if pos >= len(tile_images)]
+                for pos in positions_to_remove:
+                    del self.locked_tiles[pos]
+                    if pos in self.manual_overrides:
+                        del self.manual_overrides[pos]
                 
                 # Update current state
                 self.last_rack_box = rack_box
                 self.last_tile_boxes = [(t[0], t[1], t[2], t[3]) for t in tile_boxes]
                 self.current_rack_letters = letters
+                
+                # Trigger callback if rack changed
+                if rack_changed and self.on_rack_change_callback:
+                    self.on_rack_change_callback()
                 
                 # Put result in queue
                 result = {
@@ -292,15 +353,70 @@ class RackDetector:
         
         return frame
     
+    def set_turn_number(self, turn_number):
+        """Update turn number and reset locks if turn changed."""
+        if turn_number != self.current_turn_number:
+            self.current_turn_number = turn_number
+            self.reset_tile_locks()
+    
+    def reset_tile_locks(self):
+        """Reset all tile locks and overrides (called on new turn)."""
+        self.locked_tiles.clear()
+        self.manual_overrides.clear()
+        print("Rack tile locks reset for new turn")
+    
+    def set_on_rack_change(self, callback):
+        """Set callback for when rack letters change (for word solver)."""
+        self.on_rack_change_callback = callback
+    
     def get_rack_letters(self):
         """
         Get the current letters detected on the rack.
+        Uses locked/overridden values where available.
         
         Returns:
             String of letters (e.g., "ABCDEFG") or empty string
         """
-        return ''.join(letter for letter, conf, _ in self.current_rack_letters 
-                      if letter not in ('?', '*'))
+        result = []
+        for i, (letter, conf, _) in enumerate(self.current_rack_letters):
+            # Check for manual override first
+            if i in self.manual_overrides:
+                override = self.manual_overrides[i]
+                if override not in ('?', '*'):
+                    result.append(override)
+            # Then check locked tiles
+            elif i in self.locked_tiles:
+                locked_letter, _, _, is_locked, _ = self.locked_tiles[i]
+                if is_locked and locked_letter not in ('?', '*'):
+                    result.append(locked_letter)
+            # Fall back to current detection
+            elif letter not in ('?', '*'):
+                result.append(letter)
+        return ''.join(result)
+    
+    def override_tile(self, position, letter):
+        """
+        Override a tile's letter at the given position.
+        Triggers word solver recalculation.
+        """
+        if 0 <= position < len(self.current_rack_letters):
+            old_letter = self.manual_overrides.get(position, 
+                         self.current_rack_letters[position][0] if position < len(self.current_rack_letters) else '?')
+            self.manual_overrides[position] = letter
+            
+            # Also update locked_tiles to reflect the override
+            if position in self.locked_tiles:
+                _, conf, tile_img, _, last_retry = self.locked_tiles[position]
+                self.locked_tiles[position] = (letter, 100, tile_img, True, last_retry)
+            
+            print(f"Tile {position} overridden: {old_letter} -> {letter}")
+            
+            # Trigger word solver recalculation
+            if self.on_rack_change_callback:
+                self.on_rack_change_callback()
+            
+            return True
+        return False
     
     def handle_virtual_rack_click(self, x, y):
         """
@@ -366,17 +482,20 @@ class RackDetector:
             print("Save cancelled")
             return True
         
-        elif key == 13 or key == 10:  # ENTER - confirm and save
+        elif key == 13 or key == 10:  # ENTER - confirm and save/override
             if self.save_input_text:
                 save_char = self.save_input_text.upper()
                 if save_char == '*' or (len(save_char) == 1 and save_char.isalpha()):
-                    # Save to dataset (no persistent override stored)
+                    # Save to dataset
                     if tile_index < len(self.current_rack_letters):
                         _, _, tile_img = self.current_rack_letters[tile_index]
                         self.save_tile_to_dataset(tile_img, save_char)
                     
+                    # Also apply as override (updates locked value and triggers word solver)
+                    self.override_tile(tile_index, save_char)
+                    
                     display = 'BLANK' if save_char == '*' else save_char
-                    print(f"Saved tile {tile_index} as '{display}' to dataset")
+                    print(f"Saved tile {tile_index} as '{display}' to dataset and applied override")
                 else:
                     print(f"Invalid input: must be A-Z or * for blank")
             
@@ -458,8 +577,18 @@ class RackDetector:
         for i, (letter, conf, tile_img) in enumerate(self.current_rack_letters):
             tile_x = start_x + i * (self.TILE_DISPLAY_SIZE + tile_spacing)
             
-            # Draw tile background (beige)
-            tile_color = (180, 210, 230)  # Light beige
+            # Check lock/override status
+            is_overridden = i in self.manual_overrides
+            is_locked = i in self.locked_tiles and self.locked_tiles[i][3]
+            
+            # Draw tile background (different colors for locked/overridden)
+            if is_overridden:
+                tile_color = (255, 255, 180)  # Cyan tint for override
+            elif is_locked:
+                tile_color = (180, 255, 200)  # Green tint for locked
+            else:
+                tile_color = (180, 210, 230)  # Light beige for unlocked
+            
             cv2.rectangle(display, 
                          (tile_x, tile_y), 
                          (tile_x + self.TILE_DISPLAY_SIZE, tile_y + self.TILE_DISPLAY_SIZE),
@@ -469,6 +598,12 @@ class RackDetector:
             if self.save_input_active and self.save_input_index == i:
                 border_color = (0, 255, 255)  # Yellow
                 border_width = 3
+            elif is_overridden:
+                border_color = (200, 100, 0)  # Blue for override
+                border_width = 2
+            elif is_locked:
+                border_color = (0, 180, 0)  # Green for locked
+                border_width = 2
             else:
                 border_color = (100, 130, 160)
                 border_width = 2
@@ -499,11 +634,20 @@ class RackDetector:
             cv2.putText(display, display_letter, (text_x, text_y),
                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, text_color, 2)
             
-            # Draw confidence indicator
-            conf_text = f"{conf}%"
-            cv2.putText(display, conf_text, 
+            # Draw confidence indicator and lock status
+            if is_overridden:
+                status_text = "OVR"
+                status_color = (200, 100, 0)
+            elif is_locked:
+                status_text = f"{conf}% L"
+                status_color = (0, 120, 0)
+            else:
+                status_text = f"{conf}%"
+                status_color = (80, 80, 80)
+            
+            cv2.putText(display, status_text, 
                        (tile_x + 2, tile_y + self.TILE_DISPLAY_SIZE - 3),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.25, (80, 80, 80), 1)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.25, status_color, 1)
         
         # Show hint at bottom
         if not self.save_input_active:
