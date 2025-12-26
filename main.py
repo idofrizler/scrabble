@@ -1688,10 +1688,97 @@ class ScrabbleTracker:
             print(f"Words refreshed: {[self.get_word_string(w) for w, _ in self.detected_words]}")
 
     def initialize(self):
-        ret, frame = self.cap.read()
-        if not ret: 
-            print("Error: Could not read video.")
-            return False
+        # Check if we're in interactive mode and need camera positioning
+        is_interactive = hasattr(self, 'interactive_mode') and self.interactive_mode
+        
+        if is_interactive and len(self.points) != 4:
+            # Interactive mode: show live camera feed until user presses a key
+            print("\n" + "=" * 50)
+            print("CAMERA POSITIONING")
+            print("=" * 50)
+            print("Position your camera so the Scrabble board is visible.")
+            print("Use +/- keys to zoom in/out (digital zoom)")
+            print("Press SPACE or ENTER to freeze the frame for corner marking.")
+            print("=" * 50 + "\n")
+            
+            cv2.namedWindow('Position Camera')
+            
+            # Digital zoom state
+            zoom_level = 1.0
+            min_zoom = 1.0
+            max_zoom = 4.0
+            zoom_step = 0.25
+            
+            while True:
+                ret, frame = self.cap.read()
+                if not ret:
+                    print("Error: Could not read from camera.")
+                    return False
+                
+                # Apply digital zoom (crop and resize)
+                if zoom_level > 1.0:
+                    h, w = frame.shape[:2]
+                    # Calculate crop region (centered)
+                    crop_w = int(w / zoom_level)
+                    crop_h = int(h / zoom_level)
+                    x1 = (w - crop_w) // 2
+                    y1 = (h - crop_h) // 2
+                    x2 = x1 + crop_w
+                    y2 = y1 + crop_h
+                    # Crop and resize back to original size
+                    cropped = frame[y1:y2, x1:x2]
+                    frame = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+                
+                # Draw instructions on frame
+                cv2.rectangle(frame, (10, 10), (frame.shape[1] - 10, 95), (0, 0, 0), -1)
+                cv2.putText(frame, "Position camera to see the board", (20, 35),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(frame, f"+/- to zoom (current: {zoom_level:.1f}x)", (20, 60),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                cv2.putText(frame, "Press SPACE or ENTER to freeze frame", (20, 85),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                
+                cv2.imshow('Position Camera', frame)
+                
+                key = cv2.waitKey(30) & 0xFF
+                if key == ord('+') or key == ord('='):  # + key (= is + without shift)
+                    zoom_level = min(zoom_level + zoom_step, max_zoom)
+                    print(f"[Zoom: {zoom_level:.1f}x]")
+                elif key == ord('-') or key == ord('_'):  # - key
+                    zoom_level = max(zoom_level - zoom_step, min_zoom)
+                    print(f"[Zoom: {zoom_level:.1f}x]")
+                elif key == 32 or key == 13 or key == 10:  # SPACE or ENTER
+                    # Capture the final frame (with zoom applied)
+                    ret, frame = self.cap.read()
+                    if not ret:
+                        print("Error: Could not capture frame.")
+                        return False
+                    # Apply zoom to captured frame too
+                    if zoom_level > 1.0:
+                        h, w = frame.shape[:2]
+                        crop_w = int(w / zoom_level)
+                        crop_h = int(h / zoom_level)
+                        x1 = (w - crop_w) // 2
+                        y1 = (h - crop_h) // 2
+                        x2 = x1 + crop_w
+                        y2 = y1 + crop_h
+                        cropped = frame[y1:y2, x1:x2]
+                        frame = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+                    # Store zoom level for use during tracking
+                    self.camera_zoom_level = zoom_level
+                    break
+                elif key == 27:  # ESC - cancel
+                    print("Camera positioning cancelled.")
+                    return False
+            
+            cv2.destroyWindow('Position Camera')
+            print(f"Frame frozen at {zoom_level:.1f}x zoom! Now mark the 4 corners of the board.")
+        else:
+            # Video mode or corners already provided: just read first frame
+            ret, frame = self.cap.read()
+            if not ret: 
+                print("Error: Could not read video.")
+                return False
         
         self.ref_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         self.display_frame = frame.copy()
@@ -2354,10 +2441,34 @@ class ScrabbleTracker:
         playback_speed = 1
         last_frame = None
         self._should_unpause = False  # Flag set by confirm_turn to auto-unpause
+        
+        # Check if we're in interactive mode (live camera)
+        is_interactive = hasattr(self, 'interactive_mode') and self.interactive_mode
 
         while True:
-            if not paused:
-                # Read frames based on playback speed
+            if is_interactive:
+                # Interactive mode: always read fresh frame from camera
+                # Pause only stops tile detection processing, not frame display
+                ret, frame = self.cap.read()
+                if not ret:
+                    print("\nCamera disconnected or error.")
+                    break
+                
+                # Apply digital zoom if set during camera positioning
+                if hasattr(self, 'camera_zoom_level') and self.camera_zoom_level > 1.0:
+                    h, w = frame.shape[:2]
+                    crop_w = int(w / self.camera_zoom_level)
+                    crop_h = int(h / self.camera_zoom_level)
+                    x1 = (w - crop_w) // 2
+                    y1 = (h - crop_h) // 2
+                    x2 = x1 + crop_w
+                    y2 = y1 + crop_h
+                    cropped = frame[y1:y2, x1:x2]
+                    frame = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+                
+                last_frame = frame.copy()
+            elif not paused:
+                # Video mode: read frames based on playback speed
                 for _ in range(playback_speed):
                     ret, last_frame = self.cap.read()
                     if not ret:
@@ -2367,7 +2478,7 @@ class ScrabbleTracker:
                     break
                 frame = last_frame
             else:
-                # When paused, use the last frame
+                # Video mode paused: use the last frame
                 if last_frame is None:
                     ret, last_frame = self.cap.read()
                     if not ret:
@@ -2477,36 +2588,47 @@ class ScrabbleTracker:
             if shift_metric > MAX_SHIFT_THRESHOLD:
                 cv2.putText(frame, "GLITCH IGNORED", (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
-            # Get video progress info
-            current_frame_num = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
-            total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            progress_pct = (current_frame_num / total_frames * 100) if total_frames > 0 else 0
-            
-            # Draw progress bar at bottom
-            bar_height = 6
-            bar_y = frame.shape[0] - bar_height - 2
-            bar_width = frame.shape[1] - 20
-            bar_x = 10
-            
-            # Background (dark gray)
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (60, 60, 60), -1)
-            # Progress (green)
-            progress_width = int(bar_width * progress_pct / 100)
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + progress_width, bar_y + bar_height), (0, 200, 0), -1)
-            # Border
-            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (150, 150, 150), 1)
-            
-            # Add pause/speed overlay (above progress bar)
+            # Status overlay depends on mode
             status_y = frame.shape[0] - 20
-            if paused:
-                cv2.putText(frame, f"PAUSED ({progress_pct:.0f}%) - Press SPACE to resume", (10, status_y),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            elif playback_speed > 1:
-                cv2.putText(frame, f"{playback_speed}x Speed ({progress_pct:.0f}%)", (10, status_y),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            
+            if is_interactive:
+                # Interactive mode: show LIVE or PAUSED (processing)
+                if paused:
+                    cv2.putText(frame, "PROCESSING PAUSED - Press SPACE to resume", (10, status_y),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                else:
+                    cv2.putText(frame, "LIVE", (10, status_y),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             else:
-                cv2.putText(frame, f"{progress_pct:.0f}%", (10, status_y),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                # Video mode: show progress bar and playback controls
+                current_frame_num = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+                total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                progress_pct = (current_frame_num / total_frames * 100) if total_frames > 0 else 0
+                
+                # Draw progress bar at bottom
+                bar_height = 6
+                bar_y = frame.shape[0] - bar_height - 2
+                bar_width = frame.shape[1] - 20
+                bar_x = 10
+                
+                # Background (dark gray)
+                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (60, 60, 60), -1)
+                # Progress (green)
+                progress_width = int(bar_width * progress_pct / 100)
+                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + progress_width, bar_y + bar_height), (0, 200, 0), -1)
+                # Border
+                cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (150, 150, 150), 1)
+                
+                # Status text
+                if paused:
+                    cv2.putText(frame, f"PAUSED ({progress_pct:.0f}%) - Press SPACE to resume", (10, status_y),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                elif playback_speed > 1:
+                    cv2.putText(frame, f"{playback_speed}x Speed ({progress_pct:.0f}%)", (10, status_y),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                else:
+                    cv2.putText(frame, f"{progress_pct:.0f}%", (10, status_y),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
             
             cv2.imshow('Scrabble Tracker', frame)
             
@@ -2752,18 +2874,15 @@ class ScrabbleTracker:
                     print("[PAUSED] - Press SPACE to resume")
                 else:
                     print("[RESUMED]")
-            elif key == ord('1'):
+            elif not is_interactive and key == ord('1'):
                 playback_speed = 1
                 print("[Speed: 1x]")
-            elif key == ord('2'):
+            elif not is_interactive and key == ord('2'):
                 playback_speed = 2
                 print("[Speed: 2x]")
-            elif key == ord('3'):
+            elif not is_interactive and key == ord('3'):
                 playback_speed = 3
                 print("[Speed: 3x]")
-            elif key == ord('4'):
-                playback_speed = 4
-                print("[Speed: 4x]")
             elif key != 255:  # Any other key
                 # Check rack detector input first (if active)
                 if self.rack_detection_enabled and self.rack_detector and self.rack_detector.handle_key_input(key):
@@ -2957,7 +3076,9 @@ class ScrabbleTracker:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Track Scrabble Board')
-    parser.add_argument('video_path', type=str, help='Path to video file')
+    parser.add_argument('video_path', type=str, nargs='?', default=None, help='Path to video file (omit for interactive camera mode)')
+    parser.add_argument('--interactive', '-i', action='store_true', help='Use camera feed instead of video file')
+    parser.add_argument('--camera', type=int, default=0, help='Camera index to use in interactive mode (default: 0)')
     parser.add_argument('--corners', type=str, help='Comma separated coordinates: x1,y1,x2,y2,x3,y3,x4,y4', default=None)
     parser.add_argument('--show-orb', action='store_true', help='Show ORB features for debugging')
     parser.add_argument('--turns', action='store_true', help='Enable turn management mode (validates placement, requires confirmation)')
@@ -2970,6 +3091,20 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
+    # Determine video source
+    if args.interactive or args.video_path is None:
+        # Interactive mode - use camera
+        video_source = args.camera
+        interactive_mode = True
+        print(f"\n=== INTERACTIVE MODE (Camera {args.camera}) ===")
+        print("Turns and rack detection are automatically enabled.")
+        print("Press SPACE to pause/resume processing")
+        print("Press ESC to exit")
+        print("=" * 45 + "\n")
+    else:
+        video_source = args.video_path
+        interactive_mode = False
+    
     manual_corners = None
     if args.corners:
         try:
@@ -2979,9 +3114,12 @@ if __name__ == "__main__":
             print("Error parsing corners. Please use format: x1,y1,x2,y2,x3,y3,x4,y4")
             sys.exit(1)
 
-    tracker = ScrabbleTracker(args.video_path, manual_corners)
+    tracker = ScrabbleTracker(video_source, manual_corners)
     tracker.show_orb = args.show_orb
-    tracker.turns_mode = args.turns
+    tracker.interactive_mode = interactive_mode
+    
+    # In interactive mode, turns are always enabled
+    tracker.turns_mode = args.turns or interactive_mode
     
     # Set up player configuration
     num_players = max(2, min(4, args.players))  # Clamp to 2-4
@@ -2991,7 +3129,7 @@ if __name__ == "__main__":
     tracker.current_player = 0  # Start with player 1 (index 0)
     tracker.player_scores = [0] * num_players
     
-    if args.turns:
+    if tracker.turns_mode:
         print("Turn management mode ENABLED - tiles will require confirmation")
         print(f"Players: {num_players}, Our position: {our_turn} (0-based index: {tracker.our_player_index})")
     else:
@@ -3004,12 +3142,12 @@ if __name__ == "__main__":
     # Set OCR backend (CNN by default, Tesseract if --use-tesseract flag)
     tracker.set_ocr_backend(use_tesseract=args.use_tesseract)
     
-    # Enable rack detection if requested
-    if args.detect_rack:
+    # In interactive mode, rack detection is always enabled
+    if args.detect_rack or interactive_mode:
         tracker.enable_rack_detection(model_path=args.rack_model)
         
-        # Initialize word solver if both turns mode and rack detection are enabled
-        if args.turns:
+        # Initialize word solver (always in interactive mode, or if turns enabled)
+        if tracker.turns_mode:
             tracker.initialize_word_solver()
     
     if tracker.initialize():
