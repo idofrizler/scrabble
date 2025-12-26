@@ -18,6 +18,13 @@ try:
 except ImportError:
     RACK_DETECTOR_AVAILABLE = False
 
+# Word solver imports
+try:
+    from word_solver import WordSolver, Move
+    WORD_SOLVER_AVAILABLE = True
+except ImportError:
+    WORD_SOLVER_AVAILABLE = False
+
 # PyTorch imports for CNN model (optional - used when not using Tesseract)
 try:
     import torch
@@ -579,6 +586,14 @@ class ScrabbleTracker:
         self.rack_detector = None
         self.rack_detection_enabled = False
         
+        # Word solver (optional - for suggesting best moves)
+        self.word_solver = None
+        self.suggested_move = None  # Current best move suggestion
+        self.suggestion_locked = False  # Once suggestion made with 7 tiles, lock it for this turn
+        self.last_solver_run_time = 0
+        self.SOLVER_COOLDOWN_MS = 3000.0  # Don't run solver more than every 3 seconds
+        self.rack_replenish_message = None  # Message to show when rack needs replenishing
+        
         # Dataset saving state
         self.dataset_dir = None  # Set via set_dataset_dir()
         self.dataset_last_save_time = {}  # (row, col) -> timestamp_ms of last save
@@ -704,9 +719,23 @@ class ScrabbleTracker:
         print(f"  Dataset: Saved {save_letter} ({save_confidence}%) -> {folder}/{filename}{override_indicator}")
         return True
 
+    def initialize_word_solver(self):
+        """Initialize the word solver with the dictionary."""
+        if not WORD_SOLVER_AVAILABLE:
+            print("Warning: Word solver not available")
+            return False
+        
+        if not self.dictionary:
+            print("Warning: Dictionary not loaded, cannot initialize word solver")
+            return False
+        
+        self.word_solver = WordSolver(self.dictionary)
+        print(f"Word solver initialized with {len(self.dictionary)} words")
+        return True
+    
     def load_dictionary(self):
         """Load Scrabble dictionary from words.txt file."""
-        dict_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'words.txt')
+        dict_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'words.txt')
         
         if not os.path.exists(dict_path):
             print(f"Warning: Dictionary file not found at {dict_path}")
@@ -805,9 +834,18 @@ class ScrabbleTracker:
 
     def draw_digital_board(self):
         """Creates a clean digital visualization of the board state with confidence coloring."""
-        # Calculate total height including confirmation panel if needed
+        # Calculate total height including confirmation panel or suggestion bar
         board_height = 450
-        total_height = board_height + (self.CONFIRM_PANEL_HEIGHT if self.awaiting_confirmation else 0)
+        suggestion_bar_height = 25
+        
+        # Determine extra height needed
+        extra_height = 0
+        if self.awaiting_confirmation:
+            extra_height = self.CONFIRM_PANEL_HEIGHT
+        elif self.suggested_move is not None or self.rack_replenish_message:
+            extra_height = suggestion_bar_height
+        
+        total_height = board_height + extra_height
         
         # Create a blank beige image (resembling a board)
         board_img = np.zeros((total_height, 450, 3), dtype=np.uint8)
@@ -1006,6 +1044,44 @@ class ScrabbleTracker:
             else:
                 self.turn_error_message = None
                 self.turn_error_time = None
+        
+        # Draw suggested move if available (ghost tiles on board, info bar below board)
+        if self.suggested_move is not None and not self.awaiting_confirmation:
+            move = self.suggested_move
+            step_x = 450 // self.grid_size
+            step_y = board_height // self.grid_size
+            
+            # Draw ghost tiles for suggested placement
+            for (r, c, letter) in move.tiles_used:
+                x1 = c * step_x
+                y1 = r * step_y
+                
+                # Semi-transparent purple background
+                overlay = board_img.copy()
+                cv2.rectangle(overlay, (x1+2, y1+2), (x1 + step_x-2, y1 + step_y-2), (255, 180, 180), -1)
+                cv2.addWeighted(overlay, 0.5, board_img, 0.5, 0, board_img)
+                
+                # Draw letter
+                text_size = cv2.getTextSize(letter, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+                text_x = x1 + (step_x - text_size[0]) // 2
+                text_y = y1 + (step_y + text_size[1]) // 2
+                cv2.putText(board_img, letter, (text_x, text_y), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, (180, 0, 180), 2)  # Purple text
+            
+            # Draw suggestion info bar BELOW the board (not overlapping)
+            direction = "→" if move.horizontal else "↓"
+            suggestion_text = f"Suggestion: {move.word} {direction} ({move.row},{move.col}) = {move.score} pts"
+            bar_y = board_height  # Start at bottom of board
+            cv2.rectangle(board_img, (0, bar_y), (450, bar_y + suggestion_bar_height), (180, 100, 180), -1)
+            cv2.putText(board_img, suggestion_text, (10, bar_y + 18), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        
+        # Draw rack replenish message if needed (below board)
+        elif self.rack_replenish_message and not self.awaiting_confirmation:
+            bar_y = board_height  # Start at bottom of board
+            cv2.rectangle(board_img, (0, bar_y), (450, bar_y + suggestion_bar_height), (0, 100, 200), -1)
+            cv2.putText(board_img, self.rack_replenish_message, (10, bar_y + 18), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
         # Draw scoreboard and turn info (top right area)
         if hasattr(self, 'player_scores') and hasattr(self, 'num_players'):
@@ -1279,6 +1355,10 @@ class ScrabbleTracker:
         self.manual_input_text = ""
         self.previous_pending_tiles = set()
         self.pending_stable_since = None
+        
+        # Reset word suggestion for next turn
+        self.suggested_move = None
+        self.suggestion_locked = False
         
         print(f"Ready for turn {self.turn_number}")
         
@@ -2246,6 +2326,29 @@ class ScrabbleTracker:
         self.last_frame_time = time.time()
         reference_captured = False
         
+        # Position windows to avoid overlap
+        # Main window on the left, secondary windows to the right and below
+        main_width = self.frame_width
+        main_height = self.frame_height
+        
+        # Create and position windows
+        base_y = 0  # Top margin (at very top of screen)
+        cv2.namedWindow('Scrabble Tracker')
+        cv2.moveWindow('Scrabble Tracker', 50, base_y)  # Main window top-left
+        
+        cv2.namedWindow('2D Board State')
+        cv2.moveWindow('2D Board State', main_width + 70, base_y)  # Right of main
+        
+        cv2.namedWindow('Digital Game State')
+        cv2.moveWindow('Digital Game State', main_width + 70, base_y + 510)  # Below 2D Board State
+        
+        if self.rack_detection_enabled:
+            # Virtual rack centered under main window
+            rack_width = 500  # RackDetector.VIRTUAL_RACK_WIDTH
+            rack_x = 50 + (main_width - rack_width) // 2  # Center under main
+            cv2.namedWindow('Virtual Rack')
+            cv2.moveWindow('Virtual Rack', rack_x, base_y + main_height + 30)  # Below main window
+        
         # Playback controls
         paused = False
         playback_speed = 1
@@ -2581,6 +2684,43 @@ class ScrabbleTracker:
                         virtual_rack = self.rack_detector.create_virtual_rack_display()
                         cv2.imshow('Virtual Rack', virtual_rack)
                         cv2.setMouseCallback('Virtual Rack', self.rack_detector.on_virtual_rack_click)
+                        
+                        # --- WORD SUGGESTION (when it's our turn) ---
+                        if (hasattr(self, 'turns_mode') and self.turns_mode and 
+                            hasattr(self, 'our_player_index') and hasattr(self, 'current_player') and
+                            self.current_player == self.our_player_index and 
+                            not self.awaiting_confirmation):
+                            
+                            rack_letters = self.rack_detector.get_rack_letters()
+                            pending_tiles_count = len(self.get_pending_tiles())
+                            
+                            # Check if rack needs replenishing (only at start of turn - no tiles placed yet, no suggestion yet)
+                            if pending_tiles_count == 0 and not self.suggestion_locked:
+                                if len(rack_letters) < 7 and len(rack_letters) > 0:
+                                    # At start of turn with incomplete rack - prompt to refill
+                                    self.rack_replenish_message = f"Replenish rack! ({len(rack_letters)}/7 tiles)"
+                                else:
+                                    self.rack_replenish_message = None
+                            else:
+                                self.rack_replenish_message = None
+                            
+                            # Run word solver only if:
+                            # 1. Not already locked (suggestion already made this turn)
+                            # 2. Have 7 letters (full rack)
+                            # 3. No tiles placed yet (start of turn)
+                            if (not self.suggestion_locked and 
+                                len(rack_letters) == 7 and 
+                                pending_tiles_count == 0 and 
+                                self.word_solver is not None):
+                                
+                                if current_time_ms - self.last_solver_run_time >= self.SOLVER_COOLDOWN_MS:
+                                    self.last_solver_run_time = current_time_ms
+                                    # Use confirmed board state for solver
+                                    self.suggested_move = self.word_solver.find_best_move(
+                                        self.confirmed_board_state, rack_letters, max_time_seconds=2.0)
+                                    if self.suggested_move is not None:
+                                        # Lock the suggestion - don't refresh during turn
+                                        self.suggestion_locked = True
 
                 # Draw the 15x15 grid (on top of overlays)
                 for i in range(1, self.grid_size):
@@ -2867,6 +3007,10 @@ if __name__ == "__main__":
     # Enable rack detection if requested
     if args.detect_rack:
         tracker.enable_rack_detection(model_path=args.rack_model)
+        
+        # Initialize word solver if both turns mode and rack detection are enabled
+        if args.turns:
+            tracker.initialize_word_solver()
     
     if tracker.initialize():
         tracker.process_video()
