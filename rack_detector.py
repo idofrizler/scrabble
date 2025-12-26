@@ -556,6 +556,9 @@ def run_standalone_demo(video_path, model_path="training/rack_tile_yolov8.pt"):
     playback_speed = 1  # 1x, 2x, 3x, 4x
     frame_skip_counter = 0
     
+    # Get total frames for progress bar
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
     try:
         frame = None
         while True:
@@ -564,10 +567,11 @@ def run_standalone_demo(video_path, model_path="training/rack_tile_yolov8.pt"):
                 for _ in range(playback_speed):
                     ret, frame = cap.read()
                     if not ret:
-                        # Loop video
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        ret, frame = cap.read()
                         break
+                
+                if not ret:
+                    print("\nEnd of video reached.")
+                    break
                 
                 # Submit frame for detection (only when not paused)
                 if frame is not None:
@@ -588,14 +592,38 @@ def run_standalone_demo(video_path, model_path="training/rack_tile_yolov8.pt"):
             # Create virtual rack display
             virtual_rack = detector.create_virtual_rack_display()
             
-            # Add status overlay to frame
+            # Get video progress
+            current_frame_num = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            progress_pct = (current_frame_num / total_frames * 100) if total_frames > 0 else 0
+            
+            # Add status overlay and progress bar to frame
             display_frame = frame.copy()
+            
+            # Draw progress bar at bottom
+            bar_height = 6
+            bar_y = display_frame.shape[0] - bar_height - 2
+            bar_width = display_frame.shape[1] - 20
+            bar_x = 10
+            
+            # Background (dark gray)
+            cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (60, 60, 60), -1)
+            # Progress (green)
+            progress_width = int(bar_width * progress_pct / 100)
+            cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x + progress_width, bar_y + bar_height), (0, 200, 0), -1)
+            # Border
+            cv2.rectangle(display_frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (150, 150, 150), 1)
+            
+            # Status text (above progress bar)
+            status_y = display_frame.shape[0] - 20
             if paused:
-                cv2.putText(display_frame, "PAUSED - Press SPACE to resume", 
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                cv2.putText(display_frame, f"PAUSED ({progress_pct:.0f}%) - Press SPACE to resume", 
+                           (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             elif playback_speed > 1:
-                cv2.putText(display_frame, f"{playback_speed}x Speed", 
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                cv2.putText(display_frame, f"{playback_speed}x Speed ({progress_pct:.0f}%)", 
+                           (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            else:
+                cv2.putText(display_frame, f"{progress_pct:.0f}%", 
+                           (10, status_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
             
             # Show windows
             cv2.imshow('Rack Detection', display_frame)

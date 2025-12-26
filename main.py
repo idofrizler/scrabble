@@ -11,6 +11,13 @@ import uuid
 import pytesseract
 from rapidfuzz import fuzz, process
 
+# Rack detection imports
+try:
+    from rack_detector import RackDetector
+    RACK_DETECTOR_AVAILABLE = True
+except ImportError:
+    RACK_DETECTOR_AVAILABLE = False
+
 # PyTorch imports for CNN model (optional - used when not using Tesseract)
 try:
     import torch
@@ -514,6 +521,8 @@ class ScrabbleTracker:
         self.turn_error_message = None  # Error message to display
         self.turn_error_time = None  # When error was set (for timeout)
         self.PENDING_STABLE_TIME_MS = 5000.0  # 5 seconds of stability before validating
+        self.CONFIRM_WAIT_PAUSE_MS = 5000.0  # 5 seconds before auto-pausing when awaiting confirmation
+        self.confirmation_started_time = None  # When confirmation UI appeared
         
         # Confirmation UI dimensions
         self.CONFIRM_PANEL_HEIGHT = 90  # Increased to fit word info + buttons
@@ -566,6 +575,10 @@ class ScrabbleTracker:
         # OCR backend preference (set via set_ocr_backend)
         self.use_tesseract = False  # Default to CNN
         
+        # Rack detector (optional)
+        self.rack_detector = None
+        self.rack_detection_enabled = False
+        
         # Dataset saving state
         self.dataset_dir = None  # Set via set_dataset_dir()
         self.dataset_last_save_time = {}  # (row, col) -> timestamp_ms of last save
@@ -576,6 +589,22 @@ class ScrabbleTracker:
         """Set the OCR backend (CNN or Tesseract) and initialize the OCR service."""
         self.use_tesseract = use_tesseract
         self.ocr_service = OCRService(use_tesseract=use_tesseract)
+    
+    def enable_rack_detection(self, model_path="training/rack_tile_yolov8.pt"):
+        """Enable rack and tile detection using YOLOv8."""
+        if not RACK_DETECTOR_AVAILABLE:
+            print("Warning: Rack detector not available. Install ultralytics: pip install ultralytics")
+            return False
+        
+        self.rack_detector = RackDetector(model_path=model_path, use_tesseract=self.use_tesseract)
+        if self.rack_detector.start():
+            self.rack_detection_enabled = True
+            print("Rack detection enabled")
+            return True
+        else:
+            print("Failed to start rack detector")
+            self.rack_detector = None
+            return False
     
     def ensure_dataset_dir_exists(self):
         """Ensure dataset_raw directory exists for saving override examples."""
@@ -1036,6 +1065,7 @@ class ScrabbleTracker:
                     x1, y1, x2, y2 = self.confirm_button_rect
                     if x1 <= x <= x2 and y1 <= y <= y2:
                         self.confirm_turn()
+                        self._should_unpause = True  # Signal to unpause
                         return
                 
                 # Check Cancel button
@@ -1241,6 +1271,7 @@ class ScrabbleTracker:
         
         # Reset turn tracking state
         self.awaiting_confirmation = False
+        self.confirmation_started_time = None  # Reset confirmation timer
         self.detected_words = []
         self.word_validations = []
         self.selected_corrections = {}
@@ -1250,6 +1281,9 @@ class ScrabbleTracker:
         self.pending_stable_since = None
         
         print(f"Ready for turn {self.turn_number}")
+        
+        # Signal that turn was confirmed (for auto-unpause)
+        return True
     
     def handle_override_input(self, key):
         """Handle keyboard input for tile override in debug view."""
@@ -1411,6 +1445,7 @@ class ScrabbleTracker:
         """Cancel the current turn confirmation and continue tracking."""
         print("Turn cancelled, continuing to track...")
         self.awaiting_confirmation = False
+        self.confirmation_started_time = None  # Reset confirmation timer
         self.detected_words = []
         self.word_validations = []
         self.selected_corrections = {}
@@ -2210,17 +2245,47 @@ class ScrabbleTracker:
         # Initialize timing
         self.last_frame_time = time.time()
         reference_captured = False
+        
+        # Playback controls
+        paused = False
+        playback_speed = 1
+        last_frame = None
+        self._should_unpause = False  # Flag set by confirm_turn to auto-unpause
 
         while True:
-            ret, frame = self.cap.read()
-            if not ret: break
+            if not paused:
+                # Read frames based on playback speed
+                for _ in range(playback_speed):
+                    ret, last_frame = self.cap.read()
+                    if not ret:
+                        break
+                if not ret:
+                    print("\nEnd of video reached.")
+                    break
+                frame = last_frame
+            else:
+                # When paused, use the last frame
+                if last_frame is None:
+                    ret, last_frame = self.cap.read()
+                    if not ret:
+                        break
+                frame = last_frame.copy()
             
             # Keep a clean copy of the frame for tile extraction (before any drawing)
             frame_clean = frame.copy()
             
-            # Calculate delta time
+            # Check if we should auto-unpause (after turn confirmation)
+            if self._should_unpause:
+                paused = False
+                self._should_unpause = False
+                print("[AUTO-RESUMED] Turn confirmed, continuing...")
+            
+            # Calculate delta time - freeze timers when paused
             current_time = time.time()
-            delta_ms = (current_time - self.last_frame_time) * 1000.0
+            if paused:
+                delta_ms = 0  # Don't advance tile detection timers when paused
+            else:
+                delta_ms = (current_time - self.last_frame_time) * 1000.0
             self.last_frame_time = current_time
             
             frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -2309,6 +2374,37 @@ class ScrabbleTracker:
             if shift_metric > MAX_SHIFT_THRESHOLD:
                 cv2.putText(frame, "GLITCH IGNORED", (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
+            # Get video progress info
+            current_frame_num = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+            total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            progress_pct = (current_frame_num / total_frames * 100) if total_frames > 0 else 0
+            
+            # Draw progress bar at bottom
+            bar_height = 6
+            bar_y = frame.shape[0] - bar_height - 2
+            bar_width = frame.shape[1] - 20
+            bar_x = 10
+            
+            # Background (dark gray)
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (60, 60, 60), -1)
+            # Progress (green)
+            progress_width = int(bar_width * progress_pct / 100)
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + progress_width, bar_y + bar_height), (0, 200, 0), -1)
+            # Border
+            cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_width, bar_y + bar_height), (150, 150, 150), 1)
+            
+            # Add pause/speed overlay (above progress bar)
+            status_y = frame.shape[0] - 20
+            if paused:
+                cv2.putText(frame, f"PAUSED ({progress_pct:.0f}%) - Press SPACE to resume", (10, status_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            elif playback_speed > 1:
+                cv2.putText(frame, f"{playback_speed}x Speed ({progress_pct:.0f}%)", (10, status_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            else:
+                cv2.putText(frame, f"{progress_pct:.0f}%", (10, status_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            
             cv2.imshow('Scrabble Tracker', frame)
             
             # New: Create and display the 2D board
@@ -2446,6 +2542,7 @@ class ScrabbleTracker:
                                             # Store word snapshot for change detection
                                             self.last_word_snapshot = self.get_word_snapshot()
                                             self.awaiting_confirmation = True
+                                            self.confirmation_started_time = current_time_ms  # Track when confirmation started
                                             print(f"Valid placement detected! Words: {[self.get_word_string(w) for w, _ in self.detected_words]}")
                                             for i, (word, is_valid_word, suggestions) in enumerate(self.word_validations):
                                                 status = "✓" if is_valid_word else "✗"
@@ -2459,11 +2556,31 @@ class ScrabbleTracker:
                         else:
                             # Already awaiting confirmation - check if we need to refresh
                             self.check_and_refresh_words(current_pending)
+                            
+                            # Auto-pause after 5 seconds of waiting for confirmation
+                            if not paused and self.confirmation_started_time is not None:
+                                wait_duration = current_time_ms - self.confirmation_started_time
+                                if wait_duration >= self.CONFIRM_WAIT_PAUSE_MS:
+                                    paused = True
+                                    print("\n[AUTO-PAUSED] Waiting for turn confirmation. Press Confirm/Cancel or SPACE to resume.")
                     
                     # Render the separate digital window
                     digital_board = self.draw_digital_board()
                     cv2.imshow('Digital Game State', digital_board)
                     cv2.setMouseCallback('Digital Game State', self.on_board_click)
+                    
+                    # --- RACK DETECTION ---
+                    if self.rack_detection_enabled and self.rack_detector is not None:
+                        # Submit frame for rack detection (non-blocking)
+                        self.rack_detector.submit_frame(frame_clean)
+                        
+                        # Get any completed results
+                        rack_result = self.rack_detector.get_results()
+                        
+                        # Create and show virtual rack display
+                        virtual_rack = self.rack_detector.create_virtual_rack_display()
+                        cv2.imshow('Virtual Rack', virtual_rack)
+                        cv2.setMouseCallback('Virtual Rack', self.rack_detector.on_virtual_rack_click)
 
                 # Draw the 15x15 grid (on top of overlays)
                 for i in range(1, self.grid_size):
@@ -2485,20 +2602,53 @@ class ScrabbleTracker:
                     self.handle_override_input(27)
                 elif self.manual_input_active:
                     self.handle_key_input(27)
+                elif self.rack_detection_enabled and self.rack_detector and self.rack_detector.save_input_active:
+                    self.rack_detector.handle_key_input(27)
                 else:
                     break
+            elif key == ord(' '):  # SPACE - toggle pause
+                paused = not paused
+                if paused:
+                    print("[PAUSED] - Press SPACE to resume")
+                else:
+                    print("[RESUMED]")
+            elif key == ord('1'):
+                playback_speed = 1
+                print("[Speed: 1x]")
+            elif key == ord('2'):
+                playback_speed = 2
+                print("[Speed: 2x]")
+            elif key == ord('3'):
+                playback_speed = 3
+                print("[Speed: 3x]")
+            elif key == ord('4'):
+                playback_speed = 4
+                print("[Speed: 4x]")
             elif key != 255:  # Any other key
-                # Check override input first (takes priority)
-                if self.override_input_active:
+                # Check rack detector input first (if active)
+                if self.rack_detection_enabled and self.rack_detector and self.rack_detector.handle_key_input(key):
+                    pass  # Key consumed by rack detector
+                # Check override input next (takes priority)
+                elif self.override_input_active:
                     self.handle_override_input(key)
                 else:
                     self.handle_key_input(key)
 
+        # Stop rack detector if running
+        if self.rack_detector is not None:
+            self.rack_detector.stop()
+        
         self.cap.release()
         cv2.destroyAllWindows()
         
         # Print final board state as 2D grid
         self.print_board_state()
+        
+        # Print rack letters if detected
+        if self.rack_detection_enabled and self.rack_detector:
+            rack_letters = self.rack_detector.get_rack_letters()
+            if rack_letters:
+                print(f"\nRack letters: {rack_letters}")
     
     def print_board_state(self):
         """Print the current board state as a 2D grid to console.
@@ -2675,6 +2825,8 @@ if __name__ == "__main__":
     parser.add_argument('--our-turn', type=int, default=1, help='Which position our player is at (1-based: 1=first, 2=second, etc.)')
     parser.add_argument('--save-dataset', type=str, default=None, help='Save detected tiles to dataset folder (e.g., dataset_raw)')
     parser.add_argument('--use-tesseract', action='store_true', help='Use Tesseract OCR instead of CNN model (default: use CNN)')
+    parser.add_argument('--detect-rack', action='store_true', help='Enable rack and tile detection using YOLOv8')
+    parser.add_argument('--rack-model', type=str, default='training/rack_tile_yolov8.pt', help='Path to rack detection YOLOv8 model')
     
     args = parser.parse_args()
     
@@ -2711,6 +2863,10 @@ if __name__ == "__main__":
     
     # Set OCR backend (CNN by default, Tesseract if --use-tesseract flag)
     tracker.set_ocr_backend(use_tesseract=args.use_tesseract)
+    
+    # Enable rack detection if requested
+    if args.detect_rack:
+        tracker.enable_rack_detection(model_path=args.rack_model)
     
     if tracker.initialize():
         tracker.process_video()
