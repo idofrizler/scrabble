@@ -451,6 +451,17 @@ class ScrabbleTracker:
     
     def __init__(self, video_path, manual_corners=None):
         self.cap = cv2.VideoCapture(video_path)
+        
+        # Try to set camera to highest resolution (4K if supported)
+        # This needs to be done before reading frames
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
+        
+        # Also set other camera properties for better quality
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))  # Use MJPEG for higher quality
+        self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)  # Enable autofocus if available
+        self.cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # Enable auto exposure
+        
         self.points = []
         if manual_corners:
             self.points = manual_corners
@@ -487,7 +498,7 @@ class ScrabbleTracker:
         
         # Tile detection parameters
         self.COLOR_CHANGE_THRESHOLD = 25.0  # LAB color difference threshold
-        self.LOCK_IN_TIME_MS = 12000.0  # 12 seconds to lock
+        self.LOCK_IN_TIME_MS = 15000.0  # 15 seconds to lock
         self.UNLOCK_TIME_MS = 5000.0  # 5 seconds to unlock
         
         # Perspective-based tile obstruction offset (pixels to ignore at bottom of each cell)
@@ -1730,13 +1741,28 @@ class ScrabbleTracker:
                     frame = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
                 
                 # Draw instructions on frame
-                cv2.rectangle(frame, (10, 10), (frame.shape[1] - 10, 95), (0, 0, 0), -1)
+                # Get actual camera resolution
+                actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                
+                # Calculate effective resolution (after zoom crop)
+                if zoom_level > 1.0:
+                    effective_width = int(actual_width / zoom_level)
+                    effective_height = int(actual_height / zoom_level)
+                else:
+                    effective_width = actual_width
+                    effective_height = actual_height
+                
+                cv2.rectangle(frame, (10, 10), (frame.shape[1] - 10, 115), (0, 0, 0), -1)
                 cv2.putText(frame, "Position camera to see the board", (20, 35),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 cv2.putText(frame, f"+/- to zoom (current: {zoom_level:.1f}x)", (20, 60),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
                 cv2.putText(frame, "Press SPACE or ENTER to freeze frame", (20, 85),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                # Display resolution info
+                cv2.putText(frame, f"Resolution: {actual_width}x{actual_height} -> {effective_width}x{effective_height}", 
+                           (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 255, 150), 1)
                 
                 cv2.imshow('Position Camera', frame)
                 
@@ -2413,10 +2439,10 @@ class ScrabbleTracker:
         self.last_frame_time = time.time()
         reference_captured = False
         
-        # Position windows to avoid overlap
-        # Main window on the left, secondary windows to the right and below
-        main_width = self.frame_width
-        main_height = self.frame_height
+        # Position windows - use display size for positioning (not full camera resolution)
+        display_scale = 0.5 if self.frame_width > 1920 else 1.0
+        display_width = int(self.frame_width * display_scale)
+        display_height = int(self.frame_height * display_scale)
         
         # Create and position windows
         base_y = 0  # Top margin (at very top of screen)
@@ -2424,17 +2450,17 @@ class ScrabbleTracker:
         cv2.moveWindow('Scrabble Tracker', 50, base_y)  # Main window top-left
         
         cv2.namedWindow('2D Board State')
-        cv2.moveWindow('2D Board State', main_width + 70, base_y)  # Right of main
+        cv2.moveWindow('2D Board State', display_width + 70, base_y)  # Right of main
         
         cv2.namedWindow('Digital Game State')
-        cv2.moveWindow('Digital Game State', main_width + 70, base_y + 510)  # Below 2D Board State
+        cv2.moveWindow('Digital Game State', display_width + 70, base_y + 510)  # Below 2D Board State
         
         if self.rack_detection_enabled:
             # Virtual rack centered under main window
             rack_width = 500  # RackDetector.VIRTUAL_RACK_WIDTH
-            rack_x = 50 + (main_width - rack_width) // 2  # Center under main
+            rack_x = 50 + (display_width - rack_width) // 2  # Center under main
             cv2.namedWindow('Virtual Rack')
-            cv2.moveWindow('Virtual Rack', rack_x, base_y + main_height + 30)  # Below main window
+            cv2.moveWindow('Virtual Rack', rack_x, base_y + display_height + 30)  # Below main window
         
         # Playback controls
         paused = False
@@ -2647,7 +2673,13 @@ class ScrabbleTracker:
                     cv2.putText(frame, f"{progress_pct:.0f}%", (10, status_y),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
             
-            cv2.imshow('Scrabble Tracker', frame)
+            # Display resized frame (keep processing at full resolution)
+            display_scale = 0.5 if self.frame_width > 1920 else 1.0
+            if display_scale < 1.0:
+                display_frame = cv2.resize(frame, None, fx=display_scale, fy=display_scale)
+            else:
+                display_frame = frame
+            cv2.imshow('Scrabble Tracker', display_frame)
             
             # New: Create and display the 2D board
             if self.current_corners is not None:
@@ -2874,7 +2906,9 @@ class ScrabbleTracker:
                     r, c = rows[-1], cols[-1] # Get last locked tile                        
 
             # Handle keyboard input
-            key = cv2.waitKey(1) & 0xFF
+            # Use longer delay for high-res to allow mouse events to process
+            wait_delay = 30 if self.frame_width > 1920 else 1
+            key = cv2.waitKey(wait_delay) & 0xFF
             if key == 27:  # ESC to quit (unless in input mode)
                 if self.override_input_active:
                     # Cancel override input, don't exit
