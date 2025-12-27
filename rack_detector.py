@@ -41,6 +41,9 @@ class RackDetector:
     CLASS_RACK = 0
     CLASS_TILE = 1
     
+    # YOLO annotation directory
+    YOLO_ANNOTATION_DIR = "data/rack_tile_manual"
+    
     # Detection thresholds
     RACK_CONFIDENCE = 0.5
     TILE_CONFIDENCE = 0.3
@@ -105,6 +108,16 @@ class RackDetector:
         
         # Turn tracking (to know when to reset locks)
         self.current_turn_number = -1
+        
+        # Manual annotation state (for R/T key drawing)
+        self.annotation_mode = None  # None, 'rack', or 'tile'
+        self.annotation_start = None  # (x, y) start point of rectangle
+        self.annotation_end = None    # (x, y) end point of rectangle
+        self.annotation_dragging = False  # True while mouse button is held down
+        self.annotation_complete = False  # True after mouse released (box ready to save)
+        self.manual_annotations = []  # List of (class_id, x1, y1, x2, y2) for current frame
+        self.pending_frame_for_annotation = None  # Frame to annotate
+        self.annotation_frame_id = None  # UUID for current annotation frame
         
         # Load YOLO model
         if YOLO_AVAILABLE:
@@ -544,6 +557,296 @@ class RackDetector:
         
         print(f"  Saved to dataset: {folder}/{filename}")
         return True
+    
+    # ========== Manual Annotation Methods ==========
+    
+    def start_annotation_mode(self, mode, frame):
+        """
+        Start annotation mode for manual bounding box drawing.
+        
+        Args:
+            mode: 'rack' or 'tile'
+            frame: Current video frame to annotate
+        """
+        if mode not in ('rack', 'tile'):
+            print(f"Invalid annotation mode: {mode}")
+            return False
+        
+        self.annotation_mode = mode
+        self.annotation_start = None
+        self.annotation_end = None
+        self.pending_frame_for_annotation = frame.copy()
+        self.annotation_frame_id = str(uuid.uuid4())[:8]
+        
+        class_name = "RACK" if mode == 'rack' else "TILE"
+        print(f"\n[ANNOTATION MODE: {class_name}]")
+        print("  Click and drag on the main window to draw bounding box")
+        print("  ENTER = Save annotation, ESC = Cancel")
+        
+        return True
+    
+    def cancel_annotation_mode(self):
+        """Cancel annotation mode without saving."""
+        if self.annotation_mode:
+            print(f"Annotation cancelled")
+        self.annotation_mode = None
+        self.annotation_start = None
+        self.annotation_end = None
+        self.annotation_dragging = False
+        self.annotation_complete = False
+        self.pending_frame_for_annotation = None
+        self.annotation_frame_id = None
+    
+    def on_annotation_mouse(self, event, x, y, flags, params):
+        """Mouse callback for annotation drawing on main window."""
+        if self.annotation_mode is None:
+            return
+        
+        if event == cv2.EVENT_LBUTTONDOWN:
+            # Start a new box
+            self.annotation_start = (x, y)
+            self.annotation_end = (x, y)
+            self.annotation_dragging = True
+            self.annotation_complete = False
+        
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if self.annotation_dragging and self.annotation_start is not None:
+                # Update box while dragging
+                self.annotation_end = (x, y)
+        
+        elif event == cv2.EVENT_LBUTTONUP:
+            if self.annotation_dragging and self.annotation_start is not None:
+                # Finalize the box
+                self.annotation_end = (x, y)
+                self.annotation_dragging = False
+                self.annotation_complete = True
+                print(f"  Box drawn: ({self.annotation_start[0]},{self.annotation_start[1]}) to ({x},{y})")
+                print(f"  Press ENTER to save, or draw another box")
+    
+    def draw_annotation_overlay(self, frame):
+        """
+        Draw current annotation rectangle on frame.
+        Returns modified frame.
+        """
+        if self.annotation_mode is None:
+            return frame
+        
+        display = frame.copy()
+        
+        # Draw instruction banner
+        class_name = "RACK" if self.annotation_mode == 'rack' else "TILE"
+        color = (255, 100, 0) if self.annotation_mode == 'rack' else (0, 255, 0)
+        
+        cv2.rectangle(display, (0, 0), (450, 30), (0, 0, 0), -1)
+        
+        # Show different message based on state
+        if self.annotation_complete and self.annotation_start is not None:
+            msg = f"{class_name} box ready - ENTER=save, ESC=cancel, or draw new"
+            msg_color = (0, 255, 255)  # Yellow when ready
+        else:
+            msg = f"Draw {class_name} box (click+drag) - ESC=cancel"
+            msg_color = color
+        
+        cv2.putText(display, msg, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.45, msg_color, 1)
+        
+        # Draw the bounding box
+        if self.annotation_start is not None and self.annotation_end is not None:
+            x1, y1 = self.annotation_start
+            x2, y2 = self.annotation_end
+            
+            # Use thicker line and different color if box is complete (ready to save)
+            if self.annotation_complete:
+                line_color = (0, 255, 255)  # Yellow when ready
+                line_thickness = 3
+            else:
+                line_color = color
+                line_thickness = 2
+            
+            cv2.rectangle(display, (x1, y1), (x2, y2), line_color, line_thickness)
+            
+            # Show dimensions
+            w, h = abs(x2 - x1), abs(y2 - y1)
+            cv2.putText(display, f"{w}x{h}", (min(x1, x2), min(y1, y2) - 5),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, line_color, 1)
+        
+        return display
+    
+    def save_annotation(self):
+        """
+        Save the current annotation to YOLO format.
+        Also includes existing model detections on first save.
+        Returns True if saved successfully.
+        """
+        if self.annotation_mode is None or self.annotation_start is None or self.annotation_end is None:
+            print("No annotation to save")
+            return False
+        
+        if self.pending_frame_for_annotation is None:
+            print("No frame captured for annotation")
+            return False
+        
+        # Get normalized coordinates
+        frame = self.pending_frame_for_annotation
+        h, w = frame.shape[:2]
+        
+        x1, y1 = self.annotation_start
+        x2, y2 = self.annotation_end
+        
+        # Ensure x1 < x2 and y1 < y2
+        if x1 > x2:
+            x1, x2 = x2, x1
+        if y1 > y2:
+            y1, y2 = y2, y1
+        
+        # Calculate YOLO format (center_x, center_y, width, height) normalized 0-1
+        center_x = ((x1 + x2) / 2) / w
+        center_y = ((y1 + y2) / 2) / h
+        box_w = (x2 - x1) / w
+        box_h = (y2 - y1) / h
+        
+        # Class ID: 0=rack, 1=tile
+        class_id = self.CLASS_RACK if self.annotation_mode == 'rack' else self.CLASS_TILE
+        
+        # Create directory structure
+        images_dir = os.path.join(self.YOLO_ANNOTATION_DIR, "images")
+        labels_dir = os.path.join(self.YOLO_ANNOTATION_DIR, "labels")
+        os.makedirs(images_dir, exist_ok=True)
+        os.makedirs(labels_dir, exist_ok=True)
+        
+        # File names
+        frame_id = self.annotation_frame_id
+        image_path = os.path.join(images_dir, f"manual_{frame_id}.jpg")
+        label_path = os.path.join(labels_dir, f"manual_{frame_id}.txt")
+        
+        # Check if we're adding to existing annotation file
+        existing_annotations = []
+        is_first_save = not os.path.exists(label_path)
+        
+        if not is_first_save:
+            with open(label_path, 'r') as f:
+                existing_annotations = f.readlines()
+        else:
+            # FIRST SAVE: Include all existing model detections (rack + tiles)
+            # This ensures the new training data contains all relevant objects
+            print("  Including existing model detections...")
+            
+            # Add detected rack box
+            if self.last_rack_box is not None:
+                rx1, ry1, rx2, ry2 = self.last_rack_box
+                rack_cx = ((rx1 + rx2) / 2) / w
+                rack_cy = ((ry1 + ry2) / 2) / h
+                rack_w = (rx2 - rx1) / w
+                rack_h = (ry2 - ry1) / h
+                existing_annotations.append(f"{self.CLASS_RACK} {rack_cx:.6f} {rack_cy:.6f} {rack_w:.6f} {rack_h:.6f}\n")
+                print(f"    Added detected rack: ({rx1},{ry1}) -> ({rx2},{ry2})")
+            
+            # Add detected tile boxes
+            for tx1, ty1, tx2, ty2 in self.last_tile_boxes:
+                tile_cx = ((tx1 + tx2) / 2) / w
+                tile_cy = ((ty1 + ty2) / 2) / h
+                tile_w = (tx2 - tx1) / w
+                tile_h = (ty2 - ty1) / h
+                existing_annotations.append(f"{self.CLASS_TILE} {tile_cx:.6f} {tile_cy:.6f} {tile_w:.6f} {tile_h:.6f}\n")
+            
+            if self.last_tile_boxes:
+                print(f"    Added {len(self.last_tile_boxes)} detected tiles")
+        
+        # Add the new manual annotation
+        annotation_line = f"{class_id} {center_x:.6f} {center_y:.6f} {box_w:.6f} {box_h:.6f}\n"
+        existing_annotations.append(annotation_line)
+        
+        # Save image (only if first annotation for this frame)
+        if is_first_save:
+            cv2.imwrite(image_path, frame)
+            print(f"  Saved image: {image_path}")
+        
+        # Save/update label file
+        with open(label_path, 'w') as f:
+            f.writelines(existing_annotations)
+        
+        class_name = "rack" if class_id == 0 else "tile"
+        print(f"  Saved {class_name} annotation: {label_path}")
+        print(f"    Box: ({x1},{y1}) -> ({x2},{y2})")
+        print(f"    YOLO: {center_x:.4f} {center_y:.4f} {box_w:.4f} {box_h:.4f}")
+        print(f"    Total annotations in file: {len(existing_annotations)}")
+        
+        # If this was a rack annotation, use it for tile detection
+        if self.annotation_mode == 'rack':
+            self.last_rack_box = (x1, y1, x2, y2)
+            print(f"  Using this rack box for tile detection")
+        elif self.annotation_mode == 'tile':
+            # If we annotated a tile, run OCR on it
+            tile_img = frame[y1:y2, x1:x2].copy()
+            if self.ocr_service is not None and tile_img.size > 0:
+                letter, conf, _ = self.ocr_service._recognize_tile(tile_img)
+                print(f"  OCR result: {letter} ({conf}%)")
+                
+                # Add to current rack letters for display
+                self.last_tile_boxes.append((x1, y1, x2, y2))
+                self.current_rack_letters.append((letter, conf, tile_img))
+        
+        # Keep annotation mode active for more annotations (same frame)
+        self.annotation_start = None
+        self.annotation_end = None
+        self.annotation_dragging = False
+        self.annotation_complete = False
+        
+        return True
+    
+    def finish_annotation_session(self):
+        """End annotation session and return to normal mode."""
+        if self.annotation_mode:
+            mode = self.annotation_mode
+            self.annotation_mode = None
+            self.annotation_start = None
+            self.annotation_end = None
+            self.annotation_dragging = False
+            self.annotation_complete = False
+            self.pending_frame_for_annotation = None
+            
+            class_name = "RACK" if mode == 'rack' else "TILE"
+            print(f"[ANNOTATION MODE ENDED: {class_name}]")
+    
+    def is_annotating(self):
+        """Check if currently in annotation mode."""
+        return self.annotation_mode is not None
+    
+    def handle_annotation_key(self, key):
+        """
+        Handle keyboard input during annotation mode.
+        Returns True if key was consumed.
+        """
+        if not self.is_annotating():
+            return False
+        
+        if key == 27:  # ESC - cancel annotation mode
+            self.cancel_annotation_mode()
+            return True
+        
+        elif key == 13 or key == 10:  # ENTER - save annotation
+            if self.annotation_start is not None and self.annotation_end is not None:
+                self.save_annotation()
+            else:
+                print("Draw a bounding box first (click and drag)")
+            return True
+        
+        elif key == ord('r') or key == ord('R'):
+            # Switch to rack annotation mode (same frame)
+            self.annotation_mode = 'rack'
+            self.annotation_start = None
+            self.annotation_end = None
+            print("Switched to RACK annotation mode")
+            return True
+        
+        elif key == ord('t') or key == ord('T'):
+            # Switch to tile annotation mode (same frame)
+            self.annotation_mode = 'tile'
+            self.annotation_start = None
+            self.annotation_end = None
+            print("Switched to TILE annotation mode")
+            return True
+        
+        return True  # Consume all keys during annotation
     
     def create_virtual_rack_display(self):
         """

@@ -2662,30 +2662,42 @@ class ScrabbleTracker:
 
         while True:
             if is_interactive:
-                # Interactive mode: always read fresh frame from camera
-                # Pause only stops tile detection processing, not frame display
-                ret, frame = self.cap.read()
-                if not ret:
-                    print("\nCamera disconnected or error.")
-                    break
-                
-                # Apply digital zoom if set during camera positioning
-                if hasattr(self, 'camera_zoom_level') and self.camera_zoom_level > 1.0:
-                    h, w = frame.shape[:2]
-                    crop_w = int(w / self.camera_zoom_level)
-                    crop_h = int(h / self.camera_zoom_level)
-                    x1 = (w - crop_w) // 2
-                    y1 = (h - crop_h) // 2
-                    x2 = x1 + crop_w
-                    y2 = y1 + crop_h
-                    cropped = frame[y1:y2, x1:x2]
-                    frame = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
-                
-                last_frame = frame.copy()
-                
-                # Write frame to video if recording
-                if video_writer is not None:
-                    video_writer.write(frame)
+                # Check if we're in annotation mode - use frozen frame
+                if self.rack_detection_enabled and self.rack_detector and self.rack_detector.is_annotating():
+                    # Use the frozen frame for annotation
+                    if self.rack_detector.pending_frame_for_annotation is not None:
+                        frame = self.rack_detector.pending_frame_for_annotation.copy()
+                    elif last_frame is not None:
+                        frame = last_frame.copy()
+                    else:
+                        ret, frame = self.cap.read()
+                        if not ret:
+                            print("\nCamera disconnected or error.")
+                            break
+                else:
+                    # Normal mode: read fresh frame from camera
+                    ret, frame = self.cap.read()
+                    if not ret:
+                        print("\nCamera disconnected or error.")
+                        break
+                    
+                    # Apply digital zoom if set during camera positioning
+                    if hasattr(self, 'camera_zoom_level') and self.camera_zoom_level > 1.0:
+                        h, w = frame.shape[:2]
+                        crop_w = int(w / self.camera_zoom_level)
+                        crop_h = int(h / self.camera_zoom_level)
+                        x1 = (w - crop_w) // 2
+                        y1 = (h - crop_h) // 2
+                        x2 = x1 + crop_w
+                        y2 = y1 + crop_h
+                        cropped = frame[y1:y2, x1:x2]
+                        frame = cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+                    
+                    last_frame = frame.copy()
+                    
+                    # Write frame to video if recording
+                    if video_writer is not None:
+                        video_writer.write(frame)
             elif not paused:
                 # Video mode: read frames based on playback speed
                 for _ in range(playback_speed):
@@ -2848,6 +2860,14 @@ class ScrabbleTracker:
                 else:
                     cv2.putText(frame, f"{progress_pct:.0f}%", (10, status_y),
                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            
+            # Draw rack/tile detection boxes on main frame (before resize)
+            if self.rack_detection_enabled and self.rack_detector is not None:
+                self.rack_detector.draw_detections(frame)
+            
+            # Draw annotation overlay if in annotation mode
+            if self.rack_detection_enabled and self.rack_detector and self.rack_detector.is_annotating():
+                frame = self.rack_detector.draw_annotation_overlay(frame)
             
             # Display resized frame (keep processing at full resolution)
             display_scale = 0.5 if self.frame_width > 1920 else 1.0
@@ -3024,6 +3044,9 @@ class ScrabbleTracker:
                         # Submit frame for rack detection (non-blocking)
                         self.rack_detector.submit_frame(frame_clean)
                         
+                        # Draw rack/tile detection boxes on main frame
+                        self.rack_detector.draw_detections(frame)
+                        
                         # Get any completed results
                         rack_result = self.rack_detector.get_results()
                         
@@ -3111,12 +3134,45 @@ class ScrabbleTracker:
                 playback_speed = 3
                 print("[Speed: 3x]")
             elif key != 255:  # Any other key
-                # Check rack detector input first (if active)
-                if self.rack_detection_enabled and self.rack_detector and self.rack_detector.handle_key_input(key):
+                # Check annotation mode first (highest priority)
+                if self.rack_detection_enabled and self.rack_detector and self.rack_detector.is_annotating():
+                    was_annotating = True
+                    if self.rack_detector.handle_annotation_key(key):
+                        pass  # Key consumed by annotation mode
+                    # Check if annotation mode finished (D pressed or ESC cancelled)
+                    if key == ord('d') or key == ord('D'):
+                        # 'D' = Done with annotation session
+                        self.rack_detector.finish_annotation_session()
+                    
+                    # If annotation mode ended, unpause video
+                    if was_annotating and not self.rack_detector.is_annotating():
+                        paused = False
+                        print("[RESUMED] Annotation mode ended")
+                # Check rack detector input next (if active)
+                elif self.rack_detection_enabled and self.rack_detector and self.rack_detector.handle_key_input(key):
                     pass  # Key consumed by rack detector
                 # Check override input next (takes priority)
                 elif self.override_input_active:
                     self.handle_override_input(key)
+                # Check for R/T to start annotation mode
+                elif (key == ord('r') or key == ord('R')) and self.rack_detection_enabled and self.rack_detector:
+                    # Start rack annotation mode and pause video
+                    self.rack_detector.start_annotation_mode('rack', frame_clean)
+                    paused = True
+                    # Set mouse callback for annotation drawing (with scale factor)
+                    scale = 0.5 if self.frame_width > 1920 else 1.0
+                    cv2.setMouseCallback('Scrabble Tracker', 
+                        lambda event, x, y, flags, param: self.rack_detector.on_annotation_mouse(
+                            event, int(x / param), int(y / param), flags, None), scale)
+                elif (key == ord('t') or key == ord('T')) and self.rack_detection_enabled and self.rack_detector:
+                    # Start tile annotation mode and pause video
+                    self.rack_detector.start_annotation_mode('tile', frame_clean)
+                    paused = True
+                    # Set mouse callback for annotation drawing (with scale factor)
+                    scale = 0.5 if self.frame_width > 1920 else 1.0
+                    cv2.setMouseCallback('Scrabble Tracker', 
+                        lambda event, x, y, flags, param: self.rack_detector.on_annotation_mouse(
+                            event, int(x / param), int(y / param), flags, None), scale)
                 else:
                     self.handle_key_input(key)
 
