@@ -1190,8 +1190,184 @@ class ScrabbleTracker:
                 else:
                     print(f"No cached image for cell ({row},{col})")
     
+    def show_camera_geometry_debug(self, row, col):
+        """
+        Show a debug view of the camera geometry relative to a specific cell.
+        Uses known board dimensions (30.8cm x 30.8cm) to calculate real-world distances.
+        Shows the triangle: Camera -> Cell on Board -> Cell on Floor (projected).
+        """
+        if self.rvec is None or self.tvec is None:
+            print("Cannot show camera geometry: no pose data available")
+            return
+        
+        # Real board dimensions in cm (30.8 x 30.8 cm for the playable area)
+        BOARD_SIZE_CM = 30.8
+        CELL_SIZE_CM = BOARD_SIZE_CM / self.grid_size  # ~2.05 cm per cell
+        TILE_HEIGHT_CM = 0.4  # Standard Scrabble tile is ~4mm thick
+        
+        # Scale factor: grid units to cm (each grid unit = CELL_SIZE_CM)
+        scale = CELL_SIZE_CM
+        
+        # Get rotation matrix from rvec
+        R, _ = cv2.Rodrigues(self.rvec)
+        
+        # Camera position in world coordinates (grid units)
+        # The translation vector gives us the board origin in camera coordinates
+        # To get camera position in world coordinates: camera_pos = -R^T * tvec
+        camera_pos_grid = -R.T @ self.tvec.flatten()
+        camera_pos_cm = camera_pos_grid * scale
+        
+        # Cell center position in world coordinates (grid units)
+        cell_center_grid = np.array([col + 0.5, row + 0.5, 0])
+        cell_center_cm = cell_center_grid * scale
+        
+        # Tile top position (Z is negative = up from board surface)
+        tile_top_grid = np.array([col + 0.5, row + 0.5, -self.TILE_HEIGHT_RATIO])
+        tile_top_cm = cell_center_cm.copy()
+        tile_top_cm[2] = -TILE_HEIGHT_CM  # Actually use real tile height
+        
+        # Calculate distances
+        camera_to_cell = np.linalg.norm(camera_pos_cm - cell_center_cm)
+        camera_height = camera_pos_cm[2] * -1  # Flip Z for intuitive display (positive = up)
+        
+        # Horizontal distance (XY plane)
+        horizontal_dist = np.linalg.norm(camera_pos_cm[:2] - cell_center_cm[:2])
+        
+        # Viewing angle (angle between camera-to-cell vector and the board plane)
+        camera_to_cell_vec = cell_center_cm - camera_pos_cm
+        # The board plane is Z=0, so the normal is (0,0,1)
+        # Angle with the normal gives us the tilt from vertical
+        vec_magnitude = np.linalg.norm(camera_to_cell_vec)
+        if vec_magnitude > 0:
+            # Angle from horizontal plane (how steep we're looking down)
+            viewing_angle_rad = np.arcsin(abs(camera_to_cell_vec[2]) / vec_magnitude)
+            viewing_angle_deg = np.degrees(viewing_angle_rad)
+        else:
+            viewing_angle_deg = 0
+        
+        # Create debug visualization
+        debug_width = 600
+        debug_height = 500
+        debug_img = np.zeros((debug_height, debug_width, 3), dtype=np.uint8)
+        debug_img[:] = (40, 40, 40)  # Dark gray background
+        
+        # Draw coordinate system info
+        cv2.putText(debug_img, f"Camera Geometry for Cell ({row}, {col})", (10, 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        
+        # Display measurements
+        y_offset = 60
+        measurements = [
+            f"Camera Height: {camera_height:.1f} cm",
+            f"Horizontal Distance: {horizontal_dist:.1f} cm",
+            f"Direct Distance: {camera_to_cell:.1f} cm",
+            f"Viewing Angle: {viewing_angle_deg:.1f}° from horizontal",
+            "",
+            f"Camera Position (cm): X={camera_pos_cm[0]:.1f}, Y={camera_pos_cm[1]:.1f}, Z={-camera_pos_cm[2]:.1f}",
+            f"Cell Position (cm): X={cell_center_cm[0]:.1f}, Y={cell_center_cm[1]:.1f}",
+            f"Cell Size: {CELL_SIZE_CM:.2f} cm",
+            f"Tile Height: {TILE_HEIGHT_CM} cm"
+        ]
+        
+        for i, text in enumerate(measurements):
+            color = (200, 255, 200) if i < 4 else (180, 180, 180)
+            cv2.putText(debug_img, text, (10, y_offset + i * 22),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+        
+        # Draw side-view triangle diagram
+        diagram_y = 280
+        diagram_height = 180
+        diagram_left = 50
+        diagram_right = 550
+        diagram_width = diagram_right - diagram_left
+        
+        # Scale the diagram to fit
+        max_dist = max(horizontal_dist, camera_height, 50)  # At least 50cm for scale
+        scale_px = (diagram_width - 100) / max_dist  # Leave margins
+        
+        # Ground level (bottom of diagram)
+        ground_y = diagram_y + diagram_height - 20
+        
+        # Board position (centered in diagram)
+        board_x = diagram_left + 100  # Left margin for camera
+        board_y = ground_y
+        
+        # Camera position (relative to board)
+        cam_x = board_x + int(horizontal_dist * scale_px)
+        cam_y = ground_y - int(camera_height * scale_px)
+        
+        # Draw ground line
+        cv2.line(debug_img, (diagram_left, ground_y), (diagram_right, ground_y), (100, 100, 100), 2)
+        cv2.putText(debug_img, "Floor/Table", (diagram_right - 80, ground_y + 15),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 100, 100), 1)
+        
+        # Draw board (as a small rectangle on the ground)
+        board_width_px = int(BOARD_SIZE_CM * scale_px)
+        cv2.rectangle(debug_img, (board_x, ground_y - 5), (board_x + board_width_px, ground_y), 
+                     (139, 169, 214), -1)  # Beige color
+        cv2.putText(debug_img, f"Board ({BOARD_SIZE_CM}cm)", (board_x, ground_y + 15),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.35, (139, 169, 214), 1)
+        
+        # Mark the specific cell on the board
+        cell_x = board_x + int((col + 0.5) * CELL_SIZE_CM * scale_px)
+        cv2.circle(debug_img, (cell_x, ground_y - 3), 5, (0, 255, 0), -1)
+        
+        # Draw tile on the cell (show its height)
+        tile_height_px = max(2, int(TILE_HEIGHT_CM * scale_px))
+        cv2.rectangle(debug_img, (cell_x - 3, ground_y - 3 - tile_height_px), 
+                     (cell_x + 3, ground_y - 3), (0, 200, 200), -1)
+        
+        # Draw camera (as a small triangle/icon)
+        cam_pts = np.array([
+            [cam_x, cam_y],
+            [cam_x - 8, cam_y + 12],
+            [cam_x + 8, cam_y + 12]
+        ], dtype=np.int32)
+        cv2.fillPoly(debug_img, [cam_pts], (255, 100, 100))
+        cv2.putText(debug_img, "Camera", (cam_x - 20, cam_y - 10),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 100, 100), 1)
+        
+        # Draw viewing line (camera to cell)
+        cv2.line(debug_img, (cam_x, cam_y), (cell_x, ground_y - 3), (0, 255, 0), 2)
+        
+        # Draw height line (vertical from camera to ground)
+        cam_ground_x = cam_x
+        cv2.line(debug_img, (cam_x, cam_y), (cam_ground_x, ground_y), (255, 255, 0), 1)
+        cv2.putText(debug_img, f"{camera_height:.0f}cm", (cam_x + 5, (cam_y + ground_y) // 2),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 0), 1)
+        
+        # Draw horizontal distance line
+        cv2.line(debug_img, (cell_x, ground_y + 10), (cam_ground_x, ground_y + 10), (255, 0, 255), 1)
+        mid_x = (cell_x + cam_ground_x) // 2
+        cv2.putText(debug_img, f"{horizontal_dist:.0f}cm", (mid_x - 15, ground_y + 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 0, 255), 1)
+        
+        # Draw angle arc
+        arc_radius = 30
+        # Draw arc from horizontal line to viewing line
+        start_angle = 0  # Horizontal (pointing right)
+        end_angle = -viewing_angle_deg  # Negative because we measure down from horizontal
+        cv2.ellipse(debug_img, (cam_x, cam_y), (arc_radius, arc_radius), 
+                   0, 180 - viewing_angle_deg, 180, (0, 255, 255), 2)
+        angle_label_x = cam_x - int(arc_radius * 1.2)
+        angle_label_y = cam_y + int(arc_radius * 0.3)
+        cv2.putText(debug_img, f"{viewing_angle_deg:.0f}°", (angle_label_x, angle_label_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+        
+        # Add calculated tile extraction info
+        vertical_shift = self.calculate_tile_vertical_shift()
+        cv2.putText(debug_img, f"Calculated tile shift: {vertical_shift:.3f} grid units",
+                   (10, debug_height - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 255), 1)
+        cv2.putText(debug_img, f"Tile obstruction offset: {self.tile_obstruction_offset} px",
+                   (10, debug_height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 255), 1)
+        
+        cv2.imshow('Camera Geometry Debug', debug_img)
+    
     def show_tile_debug_view(self, row, col):
         """Display the tile debug view window for a specific cell."""
+        # Also show camera geometry debug
+        self.show_camera_geometry_debug(row, col)
+        
         cell_data = self.board_state[row][col]
         if cell_data is None or (row, col) not in self.tile_image_cache:
             return
