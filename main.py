@@ -1780,6 +1780,25 @@ class ScrabbleTracker:
         
         return total_score, word_scores
     
+    def get_board_state_with_overrides(self):
+        """
+        Get the confirmed board state with manual overrides applied.
+        Used for word solver to consider corrected tile letters.
+        """
+        board = [[None for _ in range(self.grid_size)] for _ in range(self.grid_size)]
+        for row in range(self.grid_size):
+            for col in range(self.grid_size):
+                cell = self.confirmed_board_state[row][col]
+                if cell is not None:
+                    # Check for manual override
+                    override = self.manual_overrides.get((row, col))
+                    if override:
+                        # Use override letter with 100% confidence
+                        board[row][col] = (override, 100)
+                    else:
+                        board[row][col] = cell
+        return board
+    
     def get_word_string(self, word_cells):
         """Convert a list of (row, col) cells to a word string.
         Uses manual overrides if present, otherwise uses OCR result.
@@ -3085,9 +3104,10 @@ class ScrabbleTracker:
                                 
                                 if current_time_ms - self.last_solver_run_time >= self.SOLVER_COOLDOWN_MS:
                                     self.last_solver_run_time = current_time_ms
-                                    # Use confirmed board state for solver
+                                    # Use confirmed board state with manual overrides applied
+                                    board_for_solver = self.get_board_state_with_overrides()
                                     self.suggested_move = self.word_solver.find_best_move(
-                                        self.confirmed_board_state, rack_letters, max_time_seconds=2.0)
+                                        board_for_solver, rack_letters, max_time_seconds=2.0)
                                     if self.suggested_move is not None:
                                         # Lock the suggestion - don't refresh during turn
                                         self.suggestion_locked = True
