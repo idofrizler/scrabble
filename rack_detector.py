@@ -86,6 +86,8 @@ class RackDetector:
         
         # Callback for when rack changes (for word solver recalculation)
         self.on_rack_change_callback = None
+        # Separate callback for manual overrides (always triggers refresh, even when locked)
+        self.on_rack_override_callback = None
         
         # Thread for detection
         self.detection_thread = None
@@ -407,10 +409,108 @@ class RackDetector:
                 result.append(letter)
         return ''.join(result)
     
+    def get_virtual_rack_letters(self):
+        """
+        Get the virtual rack letters (after removing letters placed on board).
+        Used for constrained OCR when placing tiles.
+        
+        Returns:
+            String of available letters on rack
+        """
+        # If no virtual rack tracking, just return all detected letters
+        if not hasattr(self, 'letters_used_on_board'):
+            return self.get_rack_letters()
+        
+        # Get current rack letters
+        rack = list(self.get_rack_letters())
+        
+        # Remove used letters
+        for letter in self.letters_used_on_board:
+            if letter in rack:
+                rack.remove(letter)
+        
+        return ''.join(rack)
+    
+    def use_letter_from_rack(self, letter):
+        """
+        Mark a letter as used (placed on board).
+        The letter will be removed from the virtual rack.
+        
+        Args:
+            letter: The letter that was placed on the board
+        
+        Returns:
+            True if letter was available and removed, False otherwise
+        """
+        if not hasattr(self, 'letters_used_on_board'):
+            self.letters_used_on_board = []
+        
+        # Check if letter is available
+        available = list(self.get_rack_letters())
+        for used in self.letters_used_on_board:
+            if used in available:
+                available.remove(used)
+        
+        if letter.upper() in available:
+            self.letters_used_on_board.append(letter.upper())
+            print(f"  Used '{letter}' from rack. Remaining: {''.join(available).replace(letter.upper(), '', 1)}")
+            return True
+        return False
+    
+    def reset_used_letters(self):
+        """Reset the used letters tracking (call at start of new turn)."""
+        if hasattr(self, 'letters_used_on_board'):
+            self.letters_used_on_board.clear()
+        else:
+            self.letters_used_on_board = []
+        # Also clear the snapshot - it will be captured again at turn start
+        self.turn_start_rack_snapshot = None
+    
+    def snapshot_rack_for_turn(self):
+        """
+        Capture the current rack letters as the turn snapshot.
+        Called at the start of our turn. This snapshot is used for constraining OCR
+        when placing tiles on the board, so that replenishing the rack mid-turn
+        doesn't affect OCR constraints.
+        
+        Returns:
+            String of rack letters that were captured
+        """
+        self.turn_start_rack_snapshot = self.get_rack_letters()
+        print(f"  Rack snapshot for turn: [{self.turn_start_rack_snapshot}]")
+        return self.turn_start_rack_snapshot
+    
+    def get_turn_available_letters(self):
+        """
+        Get available letters for this turn (original rack minus used letters).
+        Uses the turn start snapshot if available, otherwise falls back to current rack.
+        
+        This is the method that should be used for OCR constraints, as it:
+        1. Uses the original rack from turn start (not affected by mid-turn replenishment)
+        2. Subtracts letters that have already been placed on the board
+        
+        Returns:
+            String of available letters for OCR constraint
+        """
+        # Use snapshot if available, otherwise use current rack
+        if hasattr(self, 'turn_start_rack_snapshot') and self.turn_start_rack_snapshot:
+            base_letters = list(self.turn_start_rack_snapshot)
+        else:
+            base_letters = list(self.get_rack_letters())
+        
+        # Remove used letters
+        if hasattr(self, 'letters_used_on_board'):
+            for letter in self.letters_used_on_board:
+                if letter in base_letters:
+                    base_letters.remove(letter)
+        
+        return ''.join(base_letters)
+    
     def override_tile(self, position, letter):
         """
         Override a tile's letter at the given position.
-        Triggers word solver recalculation.
+        Triggers word solver recalculation via the override callback (not the regular change callback).
+        This ensures manual overrides always refresh even when the suggestion is locked.
         """
         if 0 <= position < len(self.current_rack_letters):
             old_letter = self.manual_overrides.get(position, 
@@ -424,12 +524,24 @@ class RackDetector:
             
             print(f"Tile {position} overridden: {old_letter} -> {letter}")
             
-            # Trigger word solver recalculation
-            if self.on_rack_change_callback:
+            # Trigger word solver recalculation via OVERRIDE callback
+            # This is separate from the regular change callback and always triggers a refresh
+            if self.on_rack_override_callback:
+                self.on_rack_override_callback()
+            elif self.on_rack_change_callback:
+                # Fall back to regular callback if no override callback is set
                 self.on_rack_change_callback()
             
             return True
         return False
+    
+    def set_on_rack_override(self, callback):
+        """
+        Set callback for when rack is manually overridden.
+        This callback is always triggered (even when suggestion is locked).
+        Used to refresh word suggestions after user corrects a tile.
+        """
+        self.on_rack_override_callback = callback
     
     def handle_virtual_rack_click(self, x, y):
         """

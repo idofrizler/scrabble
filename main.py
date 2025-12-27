@@ -150,13 +150,21 @@ class OCRService:
             self.use_tesseract = True
             self.cnn_model = None
     
-    def submit(self, tile_face, row, col):
-        """Submit a tile for OCR processing."""
+    def submit(self, tile_face, row, col, allowed_letters=None):
+        """
+        Submit a tile for OCR processing.
+        
+        Args:
+            tile_face: The tile image
+            row, col: Grid position
+            allowed_letters: Optional string of allowed letters (e.g., "ABCDEFG" from rack)
+                           If provided, OCR will be constrained to only these letters
+        """
         with self.pending_lock:
             self.request_counter += 1
             req_id = self.request_counter
             self.pending[(row, col)] = req_id
-        self.queue.put((tile_face.copy(), row, col, req_id))
+        self.queue.put((tile_face.copy(), row, col, req_id, allowed_letters))
     
     def cancel(self, row, col):
         """Cancel pending OCR request for a cell (called when cell unlocks)."""
@@ -183,7 +191,13 @@ class OCRService:
         """Background thread that processes OCR requests."""
         while True:
             try:
-                tile_face, row, col, req_id = self.queue.get()
+                item = self.queue.get()
+                # Handle both old format (4 items) and new format (5 items)
+                if len(item) == 4:
+                    tile_face, row, col, req_id = item
+                    allowed_letters = None
+                else:
+                    tile_face, row, col, req_id, allowed_letters = item
                 
                 # Check if request is still valid (not cancelled)
                 with self.pending_lock:
@@ -191,7 +205,11 @@ class OCRService:
                         continue  # Stale request, skip
                 
                 # Perform OCR (outside lock - this is the slow part)
-                letter, confidence, tile_clean = self._recognize_tile(tile_face)
+                # If allowed_letters provided, use constrained recognition
+                if allowed_letters:
+                    letter, confidence, tile_clean = self._recognize_tile_constrained(tile_face, allowed_letters)
+                else:
+                    letter, confidence, tile_clean = self._recognize_tile(tile_face)
                 
                 # Check again after OCR (cell might have unlocked during processing)
                 with self.pending_lock:
@@ -378,6 +396,86 @@ class OCRService:
             else:
                 display_img = cv2.cvtColor(tile_face, cv2.COLOR_GRAY2BGR)
             return ("?", 0, display_img)
+    
+    def _recognize_tile_constrained(self, tile_face, allowed_letters):
+        """
+        Recognize tile using CNN, but constrained to only allowed letters.
+        Used when placing tiles from rack to board - only rack letters are valid.
+        
+        Args:
+            tile_face: The tile image
+            allowed_letters: String of allowed letters (e.g., "ABCDEFG")
+        
+        Returns: (letter, confidence, processed_image)
+        """
+        if not TORCH_AVAILABLE or self.cnn_model is None:
+            # Fall back to unconstrained
+            return self._recognize_tile(tile_face)
+        
+        try:
+            # Prepare image for CNN
+            img_tensor = self.cnn_transform(tile_face)
+            img_tensor = img_tensor.unsqueeze(0)
+            img_tensor = img_tensor.to(self.device)
+            
+            # Run inference
+            with torch.no_grad():
+                outputs = self.cnn_model(img_tensor)
+                probabilities = torch.nn.functional.softmax(outputs, dim=1)
+                
+                # Get all probabilities
+                probs = probabilities[0].cpu().numpy()
+                
+                # Build mask for allowed classes
+                allowed_set = set(allowed_letters.upper())
+                # Also allow BLANK (*) if present in rack
+                if '*' in allowed_letters:
+                    allowed_set.add('BLANK')
+                
+                # Find best match among allowed letters only
+                best_idx = -1
+                best_prob = 0.0
+                
+                for i, class_name in enumerate(ScrabbleNet.CLASSES):
+                    # Check if this class is allowed
+                    is_allowed = False
+                    if class_name in allowed_set:
+                        is_allowed = True
+                    elif len(class_name) == 1 and class_name in allowed_set:
+                        is_allowed = True
+                    
+                    if is_allowed and probs[i] > best_prob:
+                        best_prob = probs[i]
+                        best_idx = i
+                
+                if best_idx >= 0:
+                    predicted_class = ScrabbleNet.CLASSES[best_idx]
+                    conf_percent = int(best_prob * 100)
+                    
+                    # Handle special classes
+                    if predicted_class == 'BLANK':
+                        letter = '*'
+                    else:
+                        letter = predicted_class
+                    
+                    # Create processed image for caching
+                    if len(tile_face.shape) == 3:
+                        gray = cv2.cvtColor(tile_face, cv2.COLOR_BGR2GRAY)
+                    else:
+                        gray = tile_face
+                    display_img = cv2.resize(gray, (100, 100))
+                    display_img_color = cv2.cvtColor(display_img, cv2.COLOR_GRAY2BGR)
+                    
+                    print(f"  Constrained OCR: {letter} ({conf_percent}%) from rack [{allowed_letters}]")
+                    return (letter, conf_percent, display_img_color)
+                else:
+                    # No allowed letter found - use unconstrained as fallback
+                    print(f"  Constrained OCR: No match in [{allowed_letters}], using unconstrained")
+                    return self._recognize_tile(tile_face)
+                
+        except Exception as e:
+            print(f"Constrained OCR Error: {e}")
+            return self._recognize_tile(tile_face)
     
     def _recognize_tile_tesseract(self, tile_face):
         """Recognize tile using Tesseract OCR. Returns (letter, confidence, processed_image)."""
@@ -1546,6 +1644,10 @@ class ScrabbleTracker:
         # Reset word suggestion for next turn
         self.suggested_move = None
         self.suggestion_locked = False
+        
+        # Reset virtual rack tracking (letters used on board)
+        if self.rack_detector is not None:
+            self.rack_detector.reset_used_letters()
         
         print(f"Ready for turn {self.turn_number}")
         
@@ -2938,6 +3040,16 @@ class ScrabbleTracker:
                                 self.tile_image_cache[(r, c)] = tile_clean
                                 print(f"Recognized {letter} (conf={confidence}) at ({r},{c})")
                                 
+                                # If this is a new tile during our turn, mark it as used from rack
+                                if (hasattr(self, 'turns_mode') and self.turns_mode and
+                                    hasattr(self, 'our_player_index') and hasattr(self, 'current_player') and
+                                    self.current_player == self.our_player_index and
+                                    self.confirmed_board_state[r][c] is None and
+                                    self.rack_detector is not None and
+                                    confidence >= self.OCR_MIN_CONFIDENCE):
+                                    # Use this letter from the virtual rack
+                                    self.rack_detector.use_letter_from_rack(letter)
+                                
                                 # Save to dataset if enabled (use original cached tile)
                                 if (r, c) in self.tile_original_cache:
                                     self.save_tile_to_dataset(r, c, letter, confidence, 
@@ -2979,7 +3091,23 @@ class ScrabbleTracker:
                                         self.last_ocr_attempt_time[(r, c)] = current_time_ms
                                         # Cache the original tile capture (before OCR processing)
                                         self.tile_original_cache[(r, c)] = tile_face.copy()
-                                        self.ocr_service.submit(tile_face, r, c)
+                                        
+                                        # Check if this is a new tile placement during our turn
+                                        # If so, constrain OCR to only rack letters
+                                        allowed_letters = None
+                                        if (hasattr(self, 'turns_mode') and self.turns_mode and
+                                            hasattr(self, 'our_player_index') and hasattr(self, 'current_player') and
+                                            self.current_player == self.our_player_index and
+                                            self.confirmed_board_state[r][c] is None and
+                                            self.rack_detector is not None):
+                                            # This is a new tile during our turn - constrain to rack
+                                            # Use get_turn_available_letters() which uses the turn-start snapshot
+                                            # (not affected by mid-turn rack replenishment)
+                                            allowed_letters = self.rack_detector.get_turn_available_letters()
+                                            if allowed_letters:
+                                                print(f"  OCR constrained to rack: [{allowed_letters}] for ({r},{c})")
+                                        
+                                        self.ocr_service.submit(tile_face, r, c, allowed_letters)
                                 
                                 # Dataset: Periodic re-capture every 5 seconds
                                 # Also save if there's an override (regardless of OCR confidence)
@@ -3104,6 +3232,14 @@ class ScrabbleTracker:
                                 
                                 if current_time_ms - self.last_solver_run_time >= self.SOLVER_COOLDOWN_MS:
                                     self.last_solver_run_time = current_time_ms
+                                    
+                                    # Snapshot the rack letters at turn start for OCR constraints
+                                    # ONLY take snapshot if we don't already have one
+                                    # This ensures mid-turn rack OCR changes don't affect the snapshot
+                                    if not hasattr(self.rack_detector, 'turn_start_rack_snapshot') or \
+                                       not self.rack_detector.turn_start_rack_snapshot:
+                                        self.rack_detector.snapshot_rack_for_turn()
+                                    
                                     # Use confirmed board state with manual overrides applied
                                     board_for_solver = self.get_board_state_with_overrides()
                                     self.suggested_move = self.word_solver.find_best_move(
@@ -3469,12 +3605,28 @@ if __name__ == "__main__":
             # Set up callback for rack changes to recalculate word suggestions
             if tracker.rack_detector and tracker.word_solver:
                 def on_rack_change():
-                    # Unlock suggestion and trigger recalculation
+                    # Only unlock suggestion if we haven't already made one for this turn
+                    # AND no tiles have been placed yet
+                    # This prevents mid-turn rack OCR fluctuations from affecting the game
+                    if not tracker.suggestion_locked:
+                        # No suggestion yet - safe to recalculate
+                        tracker.suggested_move = None
+                        print("Rack changed - word suggestion will recalculate")
+                    # If suggestion_locked is True, we ignore rack OCR changes
+                    # because we've already committed to the turn-start rack snapshot
+                
+                def on_rack_override():
+                    # Manual override ALWAYS triggers a refresh, even when locked
+                    # This is important: user corrected a tile, so recalculate everything
                     tracker.suggestion_locked = False
                     tracker.suggested_move = None
-                    print("Rack changed - word suggestion will recalculate")
+                    # Clear the snapshot so it gets recaptured with corrected tiles
+                    if tracker.rack_detector:
+                        tracker.rack_detector.turn_start_rack_snapshot = None
+                    print("Rack override - unlocking and recalculating word suggestion")
                 
                 tracker.rack_detector.set_on_rack_change(on_rack_change)
+                tracker.rack_detector.set_on_rack_override(on_rack_override)
     
     if tracker.initialize():
         tracker.process_video()
